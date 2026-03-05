@@ -15,6 +15,12 @@ def is_pid_alive(pid: int) -> bool:
     return True
 
 
+def _check_pid(pid: int, host_pid: int | None) -> bool:
+    """Check if a process is alive, preferring host_pid for cross-namespace checks."""
+    check = host_pid if host_pid is not None else pid
+    return is_pid_alive(check)
+
+
 def remove_dead_processes(state: State) -> None:
-    state.leases = [lease for lease in state.leases if is_pid_alive(lease.pid)]
-    state.queue = [e for e in state.queue if is_pid_alive(e.pid)]
+    state.leases = [ls for ls in state.leases if _check_pid(ls.pid, ls.host_pid)]
+    state.queue = [e for e in state.queue if _check_pid(e.pid, e.host_pid)]

@@ -17,6 +17,7 @@ def _new_id() -> str:
 class Lease(BaseModel):
     id: str = Field(default_factory=_new_id)
     pid: int
+    host_pid: int | None = None
     resources: dict[str, int]
     priority: int = 0
     acquired_at: datetime = Field(default_factory=_utcnow)
@@ -24,6 +25,10 @@ class Lease(BaseModel):
     reclaimable: bool = False
     reclaim_requested: bool = False
     label: str | None = None
+    pids: list[int] = Field(default_factory=list)
+    actual_resources: dict[str, int] = Field(default_factory=dict)
+    cpu_seconds: float | None = None
+    progress: float | None = None
 
     model_config = {"extra": "forbid"}
 
@@ -31,6 +36,7 @@ class Lease(BaseModel):
 class QueueEntry(BaseModel):
     id: str = Field(default_factory=_new_id)
     pid: int
+    host_pid: int | None = None
     resources: dict[str, int]
     priority: int = 0
     queued_at: datetime = Field(default_factory=_utcnow)

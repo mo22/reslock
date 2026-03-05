@@ -7,6 +7,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
+from reslock.detect import get_host_pid, get_self_actual_resources, get_self_cpu_seconds
 from reslock.models import Lease, PoolStatus, QueueEntry, State
 from reslock.state import DEFAULT_STATE_PATH, ensure_state_file, read_state, transact
 
@@ -43,12 +44,47 @@ class LeaseHandle:
         while not self.reclaim_requested:
             await asyncio.sleep(poll_interval)
 
-    def update(self, estimated_seconds: int | None = None) -> None:
+    def update(
+        self,
+        estimated_seconds: int | None = None,
+        actual_resources: dict[str, int] | None = None,
+        cpu_seconds: float | None = None,
+        progress: float | None = None,
+        pids: list[int] | None = None,
+        auto_detect: bool = False,
+    ) -> None:
+        """Update lease metadata.
+
+        Args:
+            estimated_seconds: Estimated remaining seconds for this lease.
+            actual_resources: Actual resource usage (e.g., {"vram_mb": 4000, "ram_mb": 1200}).
+            cpu_seconds: CPU time consumed so far.
+            progress: Progress indicator (0.0 to 1.0).
+            pids: Additional PIDs to monitor (e.g., child processes).
+            auto_detect: If True, automatically detect actual_resources and cpu_seconds
+                using OS APIs and torch (if loaded).
+        """
+        if auto_detect:
+            detected = get_self_actual_resources()
+            if detected:
+                actual_resources = {**(actual_resources or {}), **detected}
+            cpu = get_self_cpu_seconds()
+            if cpu is not None and cpu_seconds is None:
+                cpu_seconds = cpu
+
         def _update(state: State) -> None:
             for lease in state.leases:
                 if lease.id == self._lease.id:
                     if estimated_seconds is not None:
                         lease.estimated_seconds = estimated_seconds
+                    if actual_resources is not None:
+                        lease.actual_resources = actual_resources
+                    if cpu_seconds is not None:
+                        lease.cpu_seconds = cpu_seconds
+                    if progress is not None:
+                        lease.progress = progress
+                    if pids is not None:
+                        lease.pids = pids
                     break
 
         transact(self._pool._path, _update)
@@ -64,9 +100,16 @@ class LeaseHandle:
         transact(self._pool._path, _release)
 
 
+def _detect_host_pid() -> int | None:
+    """Return host_pid if it differs from os.getpid(), else None."""
+    host = get_host_pid()
+    return host if host != os.getpid() else None
+
+
 class ResourcePool:
     def __init__(self, path: str | Path | None = None) -> None:
         self._path = Path(path) if path else DEFAULT_STATE_PATH
+        self._host_pid = _detect_host_pid()
         ensure_state_file(self._path)
 
     @contextmanager
@@ -105,9 +148,12 @@ class ResourcePool:
     ) -> LeaseHandle:
         queue_id: str | None = None
         pid = os.getpid()
+        host_pid = self._host_pid
 
         def _enqueue(state: State) -> str:
-            entry = QueueEntry(pid=pid, resources=resources, priority=priority, label=label)
+            entry = QueueEntry(
+                pid=pid, host_pid=host_pid, resources=resources, priority=priority, label=label
+            )
             state.queue.append(entry)
             return entry.id
 
@@ -135,6 +181,7 @@ class ResourcePool:
         **resources: int,
     ) -> LeaseHandle | None:
         pid = os.getpid()
+        host_pid = self._host_pid
         result: list[LeaseHandle] = []
 
         def _try(state: State) -> None:
@@ -142,6 +189,7 @@ class ResourcePool:
                 return
             lease = Lease(
                 pid=pid,
+                host_pid=host_pid,
                 resources=resources,
                 priority=priority,
                 estimated_seconds=estimated_seconds,
@@ -173,9 +221,12 @@ class ResourcePool:
         poll_interval: float,
     ) -> LeaseHandle:
         pid = os.getpid()
+        host_pid = self._host_pid
 
         def _enqueue(state: State) -> str:
-            entry = QueueEntry(pid=pid, resources=resources, priority=priority, label=label)
+            entry = QueueEntry(
+                pid=pid, host_pid=host_pid, resources=resources, priority=priority, label=label
+            )
             state.queue.append(entry)
             return entry.id
 
@@ -203,6 +254,7 @@ class ResourcePool:
         label: str | None,
     ) -> LeaseHandle | None:
         pid = os.getpid()
+        host_pid = self._host_pid
         result: list[LeaseHandle] = []
 
         def _promote(state: State) -> None:
@@ -221,6 +273,7 @@ class ResourcePool:
             if state.can_fit(resources):
                 lease = Lease(
                     pid=pid,
+                    host_pid=host_pid,
                     resources=resources,
                     priority=priority,
                     estimated_seconds=estimated_seconds,

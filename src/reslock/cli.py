@@ -15,7 +15,12 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from reslock.detect import detect_gpu_vram_mb
+from reslock.detect import (
+    detect_gpu_vram_mb,
+    get_all_pid_vram_mb,
+    get_pid_cpu_seconds,
+    get_pid_rss_mb,
+)
 from reslock.models import State
 from reslock.pool import ResourcePool
 from reslock.state import DEFAULT_STATE_PATH, ensure_state_file, transact
@@ -226,6 +231,170 @@ def schema() -> None:
 
 
 @main.command()
+@click.option("--interval", "-n", type=float, default=2.0, help="Refresh interval in seconds")
+@click.option(
+    "--count", "-c", type=int, default=None, help="Number of iterations (default: unlimited)"
+)
+@click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
+def top(interval: float, count: int | None, state: Path | None) -> None:
+    """Watch resource status with live-measured process usage."""
+    from rich.live import Live
+
+    path = state or DEFAULT_STATE_PATH
+    ensure_state_file(path)
+    pool = ResourcePool(path)
+    iterations = 0
+
+    def _render() -> Table:
+        st = pool.status()
+        # Gather live measurements — sum across main PID + registered child PIDs
+        pid_vram = get_all_pid_vram_mb()
+        lease_rss: dict[str, int] = {}
+        lease_cpu: dict[str, float] = {}
+        lease_vram: dict[str, int] = {}
+        for lease in st.leases:
+            all_pids = [lease.pid, *lease.pids]
+            rss_total = 0
+            cpu_total = 0.0
+            vram_total = 0
+            for pid in all_pids:
+                rss = get_pid_rss_mb(pid)
+                if rss:
+                    rss_total += rss
+                cpu = get_pid_cpu_seconds(pid)
+                if cpu:
+                    cpu_total += cpu
+                vram_total += pid_vram.get(pid, 0)
+            if rss_total:
+                lease_rss[lease.id] = rss_total
+            if cpu_total:
+                lease_cpu[lease.id] = cpu_total
+            if vram_total:
+                lease_vram[lease.id] = vram_total
+
+        grid = Table(title="reslock top", expand=True)
+        grid.add_column("", style="bold")
+        grid.add_column("")
+
+        # Resource summary
+        if st.resources:
+            res_parts = []
+            for key, total in st.resources.items():
+                free = st.available.get(key, 0)
+                used = total - free
+                res_parts.append(f"{key}: {used}/{total}")
+            grid.add_row("Resources", "  ".join(res_parts))
+        grid.add_row("Leases", str(len(st.leases)))
+        grid.add_row("Queue", str(len(st.queue)))
+
+        if st.leases:
+            grid.add_section()
+            grid.add_row("", "")
+
+            lease_table = Table(show_header=True, show_edge=False, pad_edge=False)
+            lease_table.add_column("PID", style="cyan", justify="right")
+            lease_table.add_column("Label")
+            lease_table.add_column("Allocated", justify="right")
+            lease_table.add_column("Actual", justify="right")
+            lease_table.add_column("RSS", justify="right")
+            lease_table.add_column("CPU", justify="right")
+            lease_table.add_column("Age", justify="right")
+            lease_table.add_column("Progress", justify="right")
+            lease_table.add_column("Flags")
+
+            now = datetime.now(timezone.utc)
+            for lease in st.leases:
+                age = now - lease.acquired_at
+                secs = int(age.total_seconds())
+                if secs >= 3600:
+                    age_str = f"{secs // 3600}h{(secs % 3600) // 60}m"
+                elif secs >= 60:
+                    age_str = f"{secs // 60}m{secs % 60}s"
+                else:
+                    age_str = f"{secs}s"
+
+                alloc_str = ", ".join(f"{k}={v}" for k, v in lease.resources.items())
+
+                # Actual resources: prefer self-reported, fall back to measured
+                actual_parts: list[str] = []
+                if lease.actual_resources:
+                    actual_parts = [f"{k}={v}" for k, v in lease.actual_resources.items()]
+                else:
+                    measured_vram = lease_vram.get(lease.id)
+                    if measured_vram:
+                        actual_parts.append(f"vram_mb={measured_vram}")
+                actual_str = ", ".join(actual_parts) if actual_parts else "-"
+
+                # Check for overuse
+                for key, val in lease.resources.items():
+                    actual_val = lease.actual_resources.get(key) or (
+                        lease_vram.get(lease.id) if key == "vram_mb" else None
+                    )
+                    if actual_val and actual_val > val:
+                        actual_str = f"[red]{actual_str}[/red]"
+                        break
+
+                pid_str = str(lease.pid)
+                if lease.pids:
+                    pid_str += f"+{len(lease.pids)}"
+
+                rss = lease_rss.get(lease.id)
+                rss_str = f"{rss}M" if rss else "-"
+
+                cpu = lease.cpu_seconds or lease_cpu.get(lease.id)
+                if cpu is not None:
+                    if cpu >= 3600:
+                        cpu_str = f"{cpu / 3600:.1f}h"
+                    elif cpu >= 60:
+                        cpu_str = f"{cpu / 60:.1f}m"
+                    else:
+                        cpu_str = f"{cpu:.1f}s"
+                else:
+                    cpu_str = "-"
+
+                progress_str = f"{lease.progress:.0%}" if lease.progress is not None else "-"
+
+                flags: list[str] = []
+                if lease.reclaimable:
+                    flags.append("R")
+                if lease.reclaim_requested:
+                    flags.append("[red]RECLAIM[/red]")
+
+                lease_table.add_row(
+                    pid_str,
+                    lease.label or "",
+                    alloc_str,
+                    actual_str,
+                    rss_str,
+                    cpu_str,
+                    age_str,
+                    progress_str,
+                    " ".join(flags),
+                )
+
+            console.print(lease_table, end="")
+
+        if st.queue:
+            grid.add_section()
+            for e in st.queue:
+                res_str = ", ".join(f"{k}={v}" for k, v in e.resources.items())
+                grid.add_row(f"Queued [{e.id}]", f"pid={e.pid}  {res_str}  prio={e.priority}")
+
+        return grid
+
+    try:
+        with Live(console=console, refresh_per_second=1, screen=False) as live:
+            while True:
+                live.update(_render())
+                iterations += 1
+                if count is not None and iterations >= count:
+                    break
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+
+@main.command()
 @click.option("--vram", default=None, help="VRAM to reserve (e.g., 4G, 500M)")
 @click.option("--ram", default=None, help="RAM to reserve (e.g., 16G)")
 @click.option("--cpu", type=int, default=None, help="CPU cores to reserve")
@@ -282,6 +451,7 @@ def run(
     ) as lease:
         console.print(f"[green]Acquired lease {lease.id}[/green]")
         proc = subprocess.Popen(list(command))
+        lease.update(pids=[proc.pid])
 
         def _sighandler(signum: int, _frame: object) -> None:
             proc.send_signal(signum)

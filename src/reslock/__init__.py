@@ -3,6 +3,6 @@
 from __future__ import annotations
 
 from reslock.models import Lease, PoolStatus, QueueEntry, State
-from reslock.pool import ResourcePool
+from reslock.pool import LeaseHandle, ResourcePool
 
-__all__ = ["Lease", "PoolStatus", "QueueEntry", "ResourcePool", "State"]
+__all__ = ["Lease", "LeaseHandle", "PoolStatus", "QueueEntry", "ResourcePool", "State"]

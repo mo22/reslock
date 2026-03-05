@@ -6,6 +6,8 @@ import re
 import signal
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -216,11 +218,27 @@ def reset(state: Path | None) -> None:
 
 
 @main.command()
+def schema() -> None:
+    """Print the JSON schema for the state file."""
+    import json
+
+    click.echo(json.dumps(State.model_json_schema(), indent=2))
+
+
+@main.command()
 @click.option("--vram", default=None, help="VRAM to reserve (e.g., 4G, 500M)")
 @click.option("--ram", default=None, help="RAM to reserve (e.g., 16G)")
 @click.option("--cpu", type=int, default=None, help="CPU cores to reserve")
 @click.option("--priority", "-p", type=int, default=0, help="Priority (higher = more urgent)")
 @click.option("--label", "-l", default=None, help="Label for this lease")
+@click.option(
+    "--reclaimable", is_flag=True, help="Allow lease to be reclaimed by higher-priority requests"
+)
+@click.option(
+    "--reclaim-signal",
+    default="SIGTERM",
+    help="Signal to send to the child process when reclaim is requested (default: SIGTERM)",
+)
 @click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
 @click.argument("command", nargs=-1, required=True)
 def run(
@@ -229,10 +247,16 @@ def run(
     cpu: int | None,
     priority: int,
     label: str | None,
+    reclaimable: bool,
+    reclaim_signal: str,
     state: Path | None,
     command: tuple[str, ...],
 ) -> None:
-    """Reserve resources and run a command."""
+    """Reserve resources and run a command.
+
+    With --reclaimable, the lease can be reclaimed by higher-priority requests.
+    When reclaim is requested, the specified signal is sent to the child process.
+    """
     resources: dict[str, int] = {}
     if vram:
         resources["vram_mb"] = _parse_size(vram)
@@ -244,12 +268,18 @@ def run(
     if not resources:
         raise click.UsageError("Specify at least one resource (--vram, --ram, --cpu)")
 
+    sig = getattr(signal, reclaim_signal, None)
+    if sig is None:
+        raise click.BadParameter(f"Unknown signal: {reclaim_signal}")
+
     path = state or DEFAULT_STATE_PATH
     ensure_state_file(path)
     pool = ResourcePool(path)
 
     console.print(f"[dim]Waiting for resources: {resources}...[/dim]")
-    with pool.acquire(priority=priority, label=label, **resources) as lease:
+    with pool.acquire(
+        priority=priority, label=label, reclaimable=reclaimable, **resources
+    ) as lease:
         console.print(f"[green]Acquired lease {lease.id}[/green]")
         proc = subprocess.Popen(list(command))
 
@@ -258,6 +288,20 @@ def run(
 
         signal.signal(signal.SIGTERM, _sighandler)
         signal.signal(signal.SIGINT, _sighandler)
+
+        if reclaimable:
+
+            def _watch_reclaim() -> None:
+                while proc.poll() is None:
+                    if lease.reclaim_requested:
+                        console.print(
+                            f"[yellow]Reclaim requested, sending {reclaim_signal} to child[/yellow]"
+                        )
+                        proc.send_signal(sig)
+                        return
+                    time.sleep(0.5)
+
+            threading.Thread(target=_watch_reclaim, daemon=True).start()
 
         returncode = proc.wait()
 

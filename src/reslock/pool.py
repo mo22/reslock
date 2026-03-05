@@ -33,6 +33,16 @@ class LeaseHandle:
                 return lease.reclaim_requested
         return True  # lease gone = treat as reclaimed
 
+    def wait_for_reclaim(self, poll_interval: float = 0.5) -> None:
+        """Block until reclaim is requested for this lease."""
+        while not self.reclaim_requested:
+            time.sleep(poll_interval)
+
+    async def wait_for_reclaim_async(self, poll_interval: float = 0.5) -> None:
+        """Async wait until reclaim is requested for this lease."""
+        while not self.reclaim_requested:
+            await asyncio.sleep(poll_interval)
+
     def update(self, estimated_seconds: int | None = None) -> None:
         def _update(state: State) -> None:
             for lease in state.leases:

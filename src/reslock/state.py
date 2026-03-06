@@ -19,8 +19,17 @@ DEFAULT_STATE_PATH = Path.home() / ".reslock" / "state.json"
 
 def ensure_state_file(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Make directory world-writable (sticky bit) so multiple users/containers can share it
+    try:
+        path.parent.chmod(0o1777)
+    except OSError:
+        pass
     if not path.exists():
         path.write_text(State().model_dump_json(indent=2))
+        try:
+            path.chmod(0o666)
+        except OSError:
+            pass
 
 
 def read_state(path: Path) -> State:
@@ -34,6 +43,7 @@ def write_state(path: Path, state: State) -> None:
     try:
         with os.fdopen(fd, "w") as f:
             f.write(state.model_dump_json(indent=2))
+        os.chmod(tmp, 0o666)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):

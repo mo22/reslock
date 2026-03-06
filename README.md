@@ -101,6 +101,42 @@ When resources aren't immediately available, requests enter a priority queue. Hi
 
 A process can mark its lease as **reclaimable** — "I'm using this, but can give it up if needed." When a higher-priority request needs those resources, `reclaim_requested` is set to `True`. The lease holder cooperates by releasing.
 
+## Docker
+
+Containers need access to the shared state file. Mount it (and its directory) from the host:
+
+```bash
+docker run --pid=host \
+  -v ~/.reslock:/root/.reslock \
+  my-gpu-app
+```
+
+- **`--pid=host`** — Required so the host can check container PIDs for dead-process cleanup. Without it, container PIDs are invisible to the host and leases won't be cleaned up when containers exit.
+- **`-v ~/.reslock:/root/.reslock`** — Mounts the state file directory. All containers and the host share the same `state.json`. The mount path inside the container must match the `state_path` used by reslock (default: `~/.reslock/state.json`).
+
+**Multi-user:** The state directory is created with mode `1777` (world-writable + sticky bit, like `/tmp`) and the state file with mode `666`, so multiple containers running as different UIDs can share it without permission issues.
+
+If your container runs as a non-root user, mount to that user's home directory instead:
+
+```bash
+docker run --pid=host \
+  -v ~/.reslock:/home/appuser/.reslock \
+  my-gpu-app
+```
+
+Or use a custom state path shared between host and containers:
+
+```python
+# Both host and container code use the same explicit path
+pool = ResourcePool(state_path="/shared/reslock/state.json")
+```
+
+```bash
+docker run --pid=host \
+  -v /shared/reslock:/shared/reslock \
+  my-gpu-app
+```
+
 ## Development
 
 ```bash

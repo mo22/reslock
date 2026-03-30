@@ -8,23 +8,30 @@ import sys
 
 
 def detect_gpu_vram_mb() -> dict[str, int]:
-    """Detect total GPU VRAM via nvidia-smi. Returns empty dict if not available."""
+    """Detect per-GPU VRAM via nvidia-smi.
+
+    Returns resources like ``{"gpu0_vram_mb": 24000, "gpu1_vram_mb": 24000}``.
+    Returns empty dict if nvidia-smi is not available or no GPUs found.
+    """
     if not shutil.which("nvidia-smi"):
         return {}
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
             timeout=10,
         )
         if result.returncode != 0:
             return {}
-        total = 0
+        resources: dict[str, int] = {}
         for line in result.stdout.strip().splitlines():
-            total += int(line.strip())
-        if total > 0:
-            return {"vram_mb": total}
+            parts = line.split(",")
+            if len(parts) == 2:
+                idx = int(parts[0].strip())
+                mb = int(parts[1].strip())
+                resources[f"gpu{idx}_vram_mb"] = mb
+        return resources
     except (subprocess.TimeoutExpired, ValueError, OSError):
         pass
     return {}
@@ -118,8 +125,29 @@ def get_pid_cpu_seconds(pid: int) -> float | None:
         return None
 
 
+def _nvidia_smi_gpu_uuid_to_index() -> dict[str, int]:
+    """Build a mapping from GPU UUID to device index via nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return {}
+        mapping: dict[str, int] = {}
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(",")
+            if len(parts) == 2:
+                mapping[parts[1].strip()] = int(parts[0].strip())
+        return mapping
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return {}
+
+
 def get_pid_vram_mb(pid: int) -> int | None:
-    """Get GPU memory usage of a process by PID via nvidia-smi."""
+    """Get GPU memory usage of a process by PID via nvidia-smi (total across GPUs)."""
     if not shutil.which("nvidia-smi"):
         return None
     try:
@@ -146,7 +174,7 @@ def get_pid_vram_mb(pid: int) -> int | None:
 
 
 def get_all_pid_vram_mb() -> dict[int, int]:
-    """Get GPU memory usage for all processes via a single nvidia-smi call."""
+    """Get GPU memory usage for all processes via a single nvidia-smi call (total per PID)."""
     if not shutil.which("nvidia-smi"):
         return {}
     try:
@@ -174,8 +202,47 @@ def get_all_pid_vram_mb() -> dict[int, int]:
         return {}
 
 
+def get_all_pid_vram_per_gpu_mb() -> dict[int, dict[int, int]]:
+    """Get per-GPU memory usage for all processes.
+
+    Returns ``{pid: {gpu_index: mb}}``. Requires two nvidia-smi calls
+    (one for UUID→index mapping, one for per-process usage).
+    """
+    if not shutil.which("nvidia-smi"):
+        return {}
+    uuid_map = _nvidia_smi_gpu_uuid_to_index()
+    if not uuid_map:
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,gpu_uuid,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return {}
+        usage: dict[int, dict[int, int]] = {}
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(",")
+            if len(parts) == 3:
+                pid = int(parts[0].strip())
+                gpu_uuid = parts[1].strip()
+                mb = int(parts[2].strip())
+                gpu_idx = uuid_map.get(gpu_uuid)
+                if gpu_idx is not None:
+                    usage.setdefault(pid, {})[gpu_idx] = usage.get(pid, {}).get(gpu_idx, 0) + mb
+        return usage
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return {}
+
+
 def get_torch_cuda_mb() -> int | None:
-    """Get CUDA memory allocated by torch in the current process. Returns None if torch not loaded."""
+    """Get total CUDA memory allocated by torch across all GPUs. Returns None if torch not loaded."""
     if "torch" not in sys.modules:
         return None
     try:
@@ -191,16 +258,39 @@ def get_torch_cuda_mb() -> int | None:
         return None
 
 
+def get_torch_cuda_per_gpu_mb() -> dict[int, int]:
+    """Get per-GPU CUDA memory allocated by torch. Returns ``{gpu_index: mb}``."""
+    if "torch" not in sys.modules:
+        return {}
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {}
+        result: dict[int, int] = {}
+        for i in range(torch.cuda.device_count()):
+            mb = int(torch.cuda.memory_allocated(i)) // (1024 * 1024)
+            if mb > 0:
+                result[i] = mb
+        return result
+    except Exception:
+        return {}
+
+
 def get_self_actual_resources() -> dict[str, int]:
-    """Detect actual resource usage of the current process. Returns what it can measure."""
+    """Detect actual resource usage of the current process.
+
+    Reports per-GPU VRAM as ``gpu0_vram_mb``, ``gpu1_vram_mb``, etc.
+    """
     result: dict[str, int] = {}
     rss = get_self_rss_mb()
     if rss is not None and rss > 0:
         result["ram_mb"] = rss
     # Prefer torch CUDA measurement (more accurate, includes tensors)
-    vram = get_torch_cuda_mb()
-    if vram is not None and vram > 0:
-        result["vram_mb"] = vram
+    per_gpu = get_torch_cuda_per_gpu_mb()
+    if per_gpu:
+        for idx, mb in per_gpu.items():
+            result[f"gpu{idx}_vram_mb"] = mb
     else:
         vram = get_pid_vram_mb(os.getpid())
         if vram is not None and vram > 0:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import signal
 import subprocess
@@ -18,6 +19,7 @@ from rich.table import Table
 from reslock.detect import (
     detect_gpu_vram_mb,
     get_all_pid_vram_mb,
+    get_all_pid_vram_per_gpu_mb,
     get_pid_cpu_seconds,
     get_pid_rss_mb,
 )
@@ -49,7 +51,7 @@ def main() -> None:
 @main.command()
 @click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
 def init(state: Path | None) -> None:
-    """Initialize reslock state file, auto-detecting GPU if available."""
+    """Initialize reslock state file, auto-detecting per-GPU VRAM."""
     path = state or DEFAULT_STATE_PATH
     ensure_state_file(path)
 
@@ -63,7 +65,8 @@ def init(state: Path | None) -> None:
     transact(path, _init)
 
     if gpu:
-        console.print(f"[green]Detected:[/green] vram_mb={gpu.get('vram_mb', 0)}")
+        for key, val in sorted(gpu.items()):
+            console.print(f"[green]Detected:[/green] {key}={val}")
     console.print(f"[green]State file:[/green] {path}")
 
 
@@ -249,14 +252,17 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
         st = pool.status()
         # Gather live measurements — sum across main PID + registered child PIDs
         pid_vram = get_all_pid_vram_mb()
+        pid_vram_per_gpu = get_all_pid_vram_per_gpu_mb()
         lease_rss: dict[str, int] = {}
         lease_cpu: dict[str, float] = {}
         lease_vram: dict[str, int] = {}
+        lease_vram_per_gpu: dict[str, dict[int, int]] = {}
         for lease in st.leases:
             all_pids = [lease.pid, *lease.pids]
             rss_total = 0
             cpu_total = 0.0
             vram_total = 0
+            per_gpu: dict[int, int] = {}
             for pid in all_pids:
                 rss = get_pid_rss_mb(pid)
                 if rss:
@@ -265,12 +271,16 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
                 if cpu:
                     cpu_total += cpu
                 vram_total += pid_vram.get(pid, 0)
+                for gpu_idx, mb in pid_vram_per_gpu.get(pid, {}).items():
+                    per_gpu[gpu_idx] = per_gpu.get(gpu_idx, 0) + mb
             if rss_total:
                 lease_rss[lease.id] = rss_total
             if cpu_total:
                 lease_cpu[lease.id] = cpu_total
             if vram_total:
                 lease_vram[lease.id] = vram_total
+            if per_gpu:
+                lease_vram_per_gpu[lease.id] = per_gpu
 
         grid = Table(title="reslock top", expand=True)
         grid.add_column("", style="bold")
@@ -320,17 +330,24 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
                 if lease.actual_resources:
                     actual_parts = [f"{k}={v}" for k, v in lease.actual_resources.items()]
                 else:
-                    measured_vram = lease_vram.get(lease.id)
-                    if measured_vram:
-                        actual_parts.append(f"vram_mb={measured_vram}")
+                    per_gpu = lease_vram_per_gpu.get(lease.id, {})
+                    if per_gpu:
+                        for gpu_idx in sorted(per_gpu):
+                            actual_parts.append(f"gpu{gpu_idx}={per_gpu[gpu_idx]}")
+                    elif lease_vram.get(lease.id):
+                        actual_parts.append(f"vram={lease_vram[lease.id]}")
                 actual_str = ", ".join(actual_parts) if actual_parts else "-"
 
                 # Check for overuse
                 for key, val in lease.resources.items():
-                    actual_val = lease.actual_resources.get(key) or (
-                        lease_vram.get(lease.id) if key == "vram_mb" else None
-                    )
-                    if actual_val and actual_val > val:
+                    actual_val = lease.actual_resources.get(key)
+                    if actual_val is None and key.startswith("gpu") and key.endswith("_vram_mb"):
+                        # Try measured per-GPU VRAM
+                        gpu_idx_str = key[3 : key.index("_")]
+                        per_gpu = lease_vram_per_gpu.get(lease.id, {})
+                        with contextlib.suppress(ValueError):
+                            actual_val = per_gpu.get(int(gpu_idx_str))
+                    if actual_val is not None and actual_val > val:
                         actual_str = f"[red]{actual_str}[/red]"
                         break
 
@@ -395,7 +412,12 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
 
 
 @main.command()
-@click.option("--vram", default=None, help="VRAM to reserve (e.g., 4G, 500M)")
+@click.option("--vram", default=None, help="VRAM to reserve on GPU 0 (e.g., 4G, 500M)")
+@click.option(
+    "--gpu-vram",
+    multiple=True,
+    help="Per-GPU VRAM: INDEX:SIZE (e.g., --gpu-vram 0:4G --gpu-vram 1:8G)",
+)
 @click.option("--ram", default=None, help="RAM to reserve (e.g., 16G)")
 @click.option("--cpu", type=int, default=None, help="CPU cores to reserve")
 @click.option("--priority", "-p", type=int, default=0, help="Priority (higher = more urgent)")
@@ -412,6 +434,7 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
 @click.argument("command", nargs=-1, required=True)
 def run(
     vram: str | None,
+    gpu_vram: tuple[str, ...],
     ram: str | None,
     cpu: int | None,
     priority: int,
@@ -428,7 +451,12 @@ def run(
     """
     resources: dict[str, int] = {}
     if vram:
-        resources["vram_mb"] = _parse_size(vram)
+        resources["gpu0_vram_mb"] = _parse_size(vram)
+    for spec in gpu_vram:
+        if ":" not in spec:
+            raise click.BadParameter(f"Expected INDEX:SIZE, got: {spec}")
+        idx_str, size_str = spec.split(":", 1)
+        resources[f"gpu{idx_str}_vram_mb"] = _parse_size(size_str)
     if ram:
         resources["ram_mb"] = _parse_size(ram)
     if cpu:

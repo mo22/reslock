@@ -9,7 +9,13 @@ from pathlib import Path
 
 from reslock.detect import get_host_pid, get_self_actual_resources, get_self_cpu_seconds
 from reslock.models import Lease, PoolStatus, QueueEntry, State
-from reslock.state import DEFAULT_STATE_PATH, ensure_state_file, read_state, transact
+from reslock.state import (
+    DEFAULT_STATE_PATH,
+    ensure_state_file,
+    read_state,
+    read_state_clean,
+    transact,
+)
 
 
 class LeaseHandle:
@@ -203,7 +209,7 @@ class ResourcePool:
         return result[0] if result else None
 
     def status(self) -> PoolStatus:
-        state = read_state(self._path)
+        state = read_state_clean(self._path)
         return PoolStatus(
             resources=state.resources,
             available=state.available(),

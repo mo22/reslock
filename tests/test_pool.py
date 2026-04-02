@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from reslock import ResourcePool
-from reslock.models import State
-from reslock.state import transact
+from reslock.models import Lease, State
+from reslock.state import read_state, transact
 
 
 def _make_pool(tmp_path: Path, **resources: int) -> ResourcePool:
@@ -64,3 +64,28 @@ def test_status(tmp_path: Path) -> None:
     st = pool.status()
     assert st.resources == {"vram_mb": 8000, "ram_mb": 16000}
     assert st.available == {"vram_mb": 8000, "ram_mb": 16000}
+
+
+def test_status_cleans_dead_leases(tmp_path: Path) -> None:
+    """status() should remove leases from dead PIDs and persist the cleanup."""
+    pool = _make_pool(tmp_path, vram_mb=8000)
+    state_path = tmp_path / "state.json"
+
+    # Inject a lease with a dead PID directly into the state file
+    def _inject(st: State) -> None:
+        st.leases.append(Lease(pid=999999999, resources={"vram_mb": 4000}))
+
+    transact(state_path, _inject)
+
+    # Verify the dead lease is in the file
+    raw = read_state(state_path)
+    assert any(ls.pid == 999999999 for ls in raw.leases)
+
+    # status() should clean it up
+    st = pool.status()
+    assert len(st.leases) == 0
+    assert st.available["vram_mb"] == 8000
+
+    # Verify the cleanup was persisted to disk
+    raw = read_state(state_path)
+    assert len(raw.leases) == 0

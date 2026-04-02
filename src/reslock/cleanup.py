@@ -21,6 +21,11 @@ def _check_pid(pid: int, host_pid: int | None) -> bool:
     return is_pid_alive(check)
 
 
+def has_dead_processes(state: State) -> bool:
+    """Check if any leases or queue entries reference dead processes."""
+    return any(not _check_pid(x.pid, x.host_pid) for x in [*state.leases, *state.queue])
+
+
 def remove_dead_processes(state: State) -> None:
     state.leases = [ls for ls in state.leases if _check_pid(ls.pid, ls.host_pid)]
     state.queue = [e for e in state.queue if _check_pid(e.pid, e.host_pid)]

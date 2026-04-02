@@ -9,7 +9,7 @@ from typing import TypeVar
 
 import portalocker
 
-from reslock.cleanup import remove_dead_processes
+from reslock.cleanup import has_dead_processes, remove_dead_processes
 from reslock.models import State
 
 T = TypeVar("T")
@@ -20,22 +20,34 @@ DEFAULT_STATE_PATH = Path.home() / ".reslock" / "state.json"
 def ensure_state_file(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Make directory world-writable (sticky bit) so multiple users/containers can share it
-    try:
+    with contextlib.suppress(OSError):
         path.parent.chmod(0o1777)
-    except OSError:
-        pass
     if not path.exists():
         path.write_text(State().model_dump_json(indent=2))
-        try:
+        with contextlib.suppress(OSError):
             path.chmod(0o666)
-        except OSError:
-            pass
 
 
 def read_state(path: Path) -> State:
     with portalocker.Lock(str(path), "r", timeout=5) as fh:
         data = fh.read()
     return State.model_validate_json(data)
+
+
+def read_state_clean(path: Path) -> State:
+    """Read state, cleaning up dead processes if any are found.
+
+    Unlike read_state(), this checks for dead PIDs and persists cleanup
+    back to the state file when needed. Avoids writes when no dead processes exist.
+    """
+    state = read_state(path)
+    if not has_dead_processes(state):
+        return state
+
+    def _identity(st: State) -> State:
+        return st
+
+    return transact(path, _identity)
 
 
 def write_state(path: Path, state: State) -> None:

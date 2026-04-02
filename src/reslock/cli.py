@@ -48,10 +48,15 @@ def main() -> None:
     """Resource lock manager for coordinating shared system resources."""
 
 
-@main.command()
+@main.command(deprecated=True)
 @click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
 def init(state: Path | None) -> None:
-    """Initialize reslock state file, auto-detecting per-GPU VRAM."""
+    """Initialize reslock state file, auto-detecting per-GPU VRAM.
+
+    Deprecated: prefer pool.set_resources() with the built-in detection
+    functions (e.g. detect_gpu_vram_mb()) — each consumer registers the
+    resources it knows about on startup.
+    """
     path = state or DEFAULT_STATE_PATH
     ensure_state_file(path)
 
@@ -68,6 +73,10 @@ def init(state: Path | None) -> None:
         for key, val in sorted(gpu.items()):
             console.print(f"[green]Detected:[/green] {key}={val}")
     console.print(f"[green]State file:[/green] {path}")
+    console.print(
+        "[yellow]Note:[/yellow] 'reslock init' is deprecated. "
+        "Prefer pool.set_resources() with detect_gpu_vram_mb() in your application startup."
+    )
 
 
 @main.command(name="set")
@@ -107,7 +116,9 @@ def status(state: Path | None) -> None:
             table.add_row(key, str(total), str(used), str(free))
         console.print(table)
     else:
-        console.print("[dim]No resources configured. Run 'reslock init' or 'reslock set'.[/dim]")
+        console.print(
+            "[dim]No resources configured. Use pool.set_resources() or 'reslock set'.[/dim]"
+        )
 
     if st.leases:
         table = Table(title=f"Leases ({len(st.leases)} active)")

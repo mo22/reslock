@@ -66,6 +66,31 @@ def test_status(tmp_path: Path) -> None:
     assert st.available == {"vram_mb": 8000, "ram_mb": 16000}
 
 
+def test_set_resources(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    pool = ResourcePool(state_path)
+
+    # Register initial resources
+    pool.set_resources({"gpu0_vram_mb": 24000, "cpu_cores": 16})
+    st = pool.status()
+    assert st.resources == {"gpu0_vram_mb": 24000, "cpu_cores": 16}
+
+    # Second call overwrites existing keys, leaves others
+    pool.set_resources({"gpu0_vram_mb": 48000, "ram_mb": 65536})
+    st = pool.status()
+    assert st.resources == {"gpu0_vram_mb": 48000, "cpu_cores": 16, "ram_mb": 65536}
+
+
+def test_set_resources_then_acquire(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    pool = ResourcePool(state_path)
+    pool.set_resources({"vram_mb": 8000})
+
+    with pool.acquire(vram_mb=3000):
+        assert pool.status().available["vram_mb"] == 5000
+    assert pool.status().available["vram_mb"] == 8000
+
+
 def test_status_cleans_dead_leases(tmp_path: Path) -> None:
     """status() should remove leases from dead PIDs and persist the cleanup."""
     pool = _make_pool(tmp_path, vram_mb=8000)

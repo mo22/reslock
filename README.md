@@ -56,15 +56,48 @@ status = pool.status()
 print(status.available)  # free resources
 ```
 
+## Registering resources
+
+reslock is resource-agnostic — it tracks arbitrary named quantities without knowing what they represent. Each consumer registers the resources it knows about on startup, before acquiring any leases:
+
+```python
+from reslock import ResourcePool
+
+pool = ResourcePool()
+pool.set_resources({"gpu0_vram_mb": 24576, "gpu1_vram_mb": 24576})
+```
+
+Multiple consumers can register different resource types independently — keys that aren't mentioned are left unchanged. This means an AI server can register GPU VRAM while a separate build system registers CPU cores, and they share the same state file.
+
+### Built-in detection functions
+
+reslock ships detection functions for common resource types. Dependencies like torch are imported lazily inside each function — safe to import even when they're not installed.
+
+| Function | Resources | Method |
+|----------|-----------|--------|
+| `detect_gpu_vram_mb()` | `gpu0_vram_mb`, ... | torch, then nvidia-smi fallback |
+| `detect_gpu_vram_mb_torch()` | `gpu0_vram_mb`, ... | torch CUDA runtime only |
+| `detect_gpu_vram_mb_nvidia_smi()` | `gpu0_vram_mb`, ... | nvidia-smi CLI only |
+| `detect_cpu_cores()` | `cpu_cores` | `os.sched_getaffinity` / `os.cpu_count` |
+| `detect_disk_mb(["/", "/data"])` | `disk_root_mb`, ... | `shutil.disk_usage` |
+| `detect_network_bandwidth()` | `net_eth0_mbps`, ... | sysfs (Linux) / networksetup (macOS) |
+
+Example startup:
+
+```python
+from reslock import ResourcePool, detect_gpu_vram_mb, detect_cpu_cores
+
+pool = ResourcePool()
+pool.set_resources(detect_gpu_vram_mb())
+pool.set_resources(detect_cpu_cores())
+```
+
 ## CLI
 
 ```bash
-# Initialize (auto-detects GPU)
-reslock init
-
 # Set resources manually
-reslock set vram_mb 24000
-reslock set gpu_slots 2
+reslock set gpu0_vram_mb 24000
+reslock set cpu_cores 16
 
 # Show status
 reslock status
@@ -85,10 +118,15 @@ reslock reset
 
 Resources are named quantities with a total capacity. Resource names are arbitrary strings — define whatever you need:
 
+```python
+pool.set_resources({"gpu0_vram_mb": 24000, "ram_mb": 65536, "gpu_slots": 2})
+```
+
+Or via CLI:
+
 ```bash
-reslock set vram_mb 24000
+reslock set gpu0_vram_mb 24000
 reslock set ram_mb 65536
-reslock set gpu_slots 2
 ```
 
 Leases reserve amounts from these pools. When a lease is released (or its process dies), the resources become available again.

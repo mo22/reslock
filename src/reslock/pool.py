@@ -208,6 +208,28 @@ class ResourcePool:
         transact(self._path, _try)
         return result[0] if result else None
 
+    def set_resources(self, resources: dict[str, int]) -> None:
+        """Register resource capacities.
+
+        Each consumer should call this on startup before acquiring leases,
+        declaring the resources it knows about. This is the recommended way
+        to populate resource capacities — it keeps reslock resource-agnostic
+        and removes the need for ``reslock init``.
+
+        Existing keys are overwritten; keys not present in *resources* are
+        left unchanged (so multiple consumers can register different resource
+        types independently).
+
+        Args:
+            resources: Mapping of resource name to total capacity,
+                e.g. ``{"gpu0_vram_mb": 24000, "cpu_cores": 16}``.
+        """
+
+        def _set(state: State) -> None:
+            state.resources.update(resources)
+
+        transact(self._path, _set)
+
     def status(self) -> PoolStatus:
         state = read_state_clean(self._path)
         return PoolStatus(

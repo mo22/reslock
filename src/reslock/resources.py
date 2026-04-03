@@ -46,7 +46,8 @@ def detect_gpu_vram_mb_torch() -> dict[str, int]:
         return {}
     resources: dict[str, int] = {}
     for i in range(torch.cuda.device_count()):
-        total = torch.cuda.get_device_properties(i).total_mem
+        props = torch.cuda.get_device_properties(i)
+        total = getattr(props, "total_memory", None) or props.total_mem
         resources[f"gpu{i}_vram_mb"] = total // (1024 * 1024)
     return resources
 

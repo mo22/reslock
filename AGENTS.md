@@ -36,9 +36,16 @@ Do NOT publish manually with `uv publish` — the project uses PyPI trusted publ
 
 ## Key Design Decisions
 
-- State file default: `~/.reslock/state.json`
+- State file default: `/var/lib/reslock/state.json` (system-wide, sticky-bit 1777). Falls back to `~/.reslock/state.json` with a warning if `/var/lib` is not writable. Override with `RESLOCK_DIR` env var. Path selection (in `_default_state_path()`) is side-effect-free; directory creation happens in `ensure_state_file()`.
 - File locks are held only during reads/writes, not for lease duration
-- Dead processes cleaned up automatically via PID checking
+- `read_state()` uses shared lock (`portalocker "r"`), `transact()` uses exclusive lock (`"r+"`) — read-heavy workloads don't block each other
+- Dead processes cleaned up automatically via PID checking; a lease is alive if owner PID OR any child PID in `lease.pids` is alive
 - Per-GPU VRAM tracking for multi-GPU systems (keyed by `gpu0_vram_mb`, `gpu1_vram_mb`, etc.)
 - Priority queue determines which waiter gets resources next
 - Reclaimable leases allow preemption by higher-priority work
+
+## CI/CD Notes
+
+- `astral-sh/setup-uv`: pin to exact version (e.g. `v8.0.0`) — rolling major tags may lag behind releases
+- PyPI trusted publishing environment (`pypi`) only works with `release` events, not `workflow_dispatch`
+- Release tags are immutable snapshots — if you fix the workflow after tagging, force-update the tag and recreate the release

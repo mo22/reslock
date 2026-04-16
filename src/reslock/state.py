@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import tempfile
 from collections.abc import Callable
@@ -13,17 +14,66 @@ from reslock.cleanup import has_dead_processes, remove_dead_processes
 from reslock.models import State
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
-DEFAULT_STATE_PATH = Path.home() / ".reslock" / "state.json"
+
+def _default_state_path() -> Path:
+    """System-wide default, overridable via RESLOCK_DIR env var.
+
+    Reslock coordinates shared resources (GPUs) across all processes on a
+    machine, regardless of user.  /var/lib/reslock is the canonical location;
+    falls back to ~/.reslock if /var/lib is not writable (e.g. unprivileged
+    container without the volume mount).
+
+    This function only *picks* the path — directory/file creation is handled
+    by ensure_state_file().
+    """
+    env = os.environ.get("RESLOCK_DIR")
+    if env:
+        return Path(env) / "state.json"
+    system_dir = Path("/var/lib/reslock")
+    if system_dir.exists():
+        if os.access(system_dir, os.W_OK):
+            return system_dir / "state.json"
+    elif os.access(system_dir.parent, os.W_OK):
+        return system_dir / "state.json"
+    user_dir = Path.home() / ".reslock"
+    try:
+        if os.access(user_dir, os.W_OK) or os.access(user_dir.parent, os.W_OK):
+            logger.warning(
+                "System state dir /var/lib/reslock is not writable, "
+                "falling back to %s — resource coordination will be per-user only",
+                user_dir,
+            )
+            return user_dir / "state.json"
+    except (OSError, RuntimeError):
+        pass
+    logger.warning(
+        "No writable state directory (tried /var/lib/reslock and %s) — "
+        "reslock will not be able to coordinate resources",
+        user_dir,
+    )
+    return user_dir / "state.json"
+
+
+DEFAULT_STATE_PATH = _default_state_path()
 
 
 def ensure_state_file(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.warning("Cannot create state directory %s", path.parent)
+        return
     # Make directory world-writable (sticky bit) so multiple users/containers can share it
     with contextlib.suppress(OSError):
         path.parent.chmod(0o1777)
     if not path.exists():
-        path.write_text(State().model_dump_json(indent=2))
+        try:
+            path.write_text(State().model_dump_json(indent=2))
+        except OSError:
+            logger.warning("Cannot create state file %s", path)
+            return
         with contextlib.suppress(OSError):
             path.chmod(0o666)
 

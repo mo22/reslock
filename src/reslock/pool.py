@@ -105,6 +105,71 @@ class LeaseHandle:
 
         transact(self._pool._path, _release)
 
+    def shrink(self, **resources: int) -> None:
+        """Atomically decrement reserved resources on this lease.
+
+        Frees capacity for other waiters without the release-and-reacquire race
+        window. Waiters polling ``acquire()`` pick up the freed capacity on
+        their next poll tick (same as after ``release()``).
+
+        Args:
+            **resources: Amount to decrement per resource key
+                (e.g. ``disk_mb=500`` subtracts 500 from the current reservation).
+                Values must be non-negative.
+
+        Raises:
+            ValueError: If any value is negative, references a key the lease
+                does not hold, or would reduce a key below zero.
+
+        Semantics:
+            - Keys that reach zero are dropped from the lease.
+            - If every remaining key reaches zero, the lease is released.
+            - No-op on an already-released lease (matches ``release()``).
+            - ``actual_resources`` is not modified — use ``update()`` for that.
+        """
+        if self._released:
+            return
+
+        for key, delta in resources.items():
+            if delta < 0:
+                raise ValueError(f"shrink amount for {key!r} must be non-negative, got {delta}")
+
+        should_release: list[bool] = []
+
+        def _shrink(state: State) -> None:
+            for lease in state.leases:
+                if lease.id != self._lease.id:
+                    continue
+                for key, delta in resources.items():
+                    current = lease.resources.get(key)
+                    if current is None:
+                        raise ValueError(
+                            f"lease does not hold resource {key!r} (has: {sorted(lease.resources)})"
+                        )
+                    new_val = current - delta
+                    if new_val < 0:
+                        raise ValueError(
+                            f"shrink would reduce {key!r} below zero "
+                            f"({current} - {delta} = {new_val})"
+                        )
+                    if new_val == 0:
+                        del lease.resources[key]
+                    else:
+                        lease.resources[key] = new_val
+                if not lease.resources:
+                    should_release.append(True)
+                break
+
+        transact(self._pool._path, _shrink)
+
+        if should_release:
+            self._released = True
+
+            def _drop(state: State) -> None:
+                state.leases = [ls for ls in state.leases if ls.id != self._lease.id]
+
+            transact(self._pool._path, _drop)
+
 
 def _detect_host_pid() -> int | None:
     """Return host_pid if it differs from os.getpid(), else None."""

@@ -1,18 +1,45 @@
 from __future__ import annotations
 
 import os
+import sys
 
 from reslock.models import Lease, QueueEntry, State
 
+if sys.platform == "win32":
+    import ctypes
 
-def is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+    # Windows: os.kill(pid, 0) doesn't behave like POSIX "signal 0 probe" — it
+    # routes to TerminateProcess with exit-code 0 and raises WinError 87. Use
+    # OpenProcess + GetExitCodeProcess instead.
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _STILL_ACTIVE = 259
+    _ERROR_ACCESS_DENIED = 5
+
+    def is_pid_alive(pid: int) -> bool:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # ACCESS_DENIED → PID exists but we can't query it; treat as alive
+            # (matches the POSIX PermissionError branch).
+            return kernel32.GetLastError() == _ERROR_ACCESS_DENIED
+        try:
+            exit_code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) == 0:
+                return False
+            return exit_code.value == _STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+
+else:
+
+    def is_pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
         return True
-    return True
 
 
 def _check_pid(pid: int, host_pid: int | None) -> bool:

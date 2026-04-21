@@ -39,16 +39,16 @@ def detect_gpu_vram_mb_torch() -> dict[str, int]:
     Returns an empty dict if torch or CUDA is unavailable.
     """
     try:
-        import torch
+        import torch  # pyright: ignore[reportMissingImports]
     except ImportError:
         return {}
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
         return {}
     resources: dict[str, int] = {}
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        total = getattr(props, "total_memory", None) or props.total_mem
-        resources[f"gpu{i}_vram_mb"] = total // (1024 * 1024)
+    for i in range(torch.cuda.device_count()):  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+        props = torch.cuda.get_device_properties(i)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        total = getattr(props, "total_memory", None) or props.total_mem  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
+        resources[f"gpu{i}_vram_mb"] = total // (1024 * 1024)  # pyright: ignore[reportUnknownArgumentType]
     return resources
 
 
@@ -94,7 +94,7 @@ def detect_cpu_cores() -> dict[str, int]:
     used as a fallback.
     """
     try:
-        count = len(os.sched_getaffinity(0))
+        count = len(os.sched_getaffinity(0))  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]
     except AttributeError:
         # macOS / systems without sched_getaffinity
         count = os.cpu_count() or 1

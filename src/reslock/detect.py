@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
-import resource
 import shutil
 import subprocess
 import sys
+
+try:
+    import resource
+except ImportError:  # pragma: no cover — Windows has no POSIX resource module
+    resource = None  # type: ignore[assignment]
 
 
 def detect_gpu_vram_mb() -> dict[str, int]:
@@ -60,6 +64,8 @@ def get_host_pid() -> int:
 
 def get_self_rss_mb() -> int | None:
     """Get RSS of the current process in MB using the resource module."""
+    if resource is None:
+        return None
     try:
         usage = resource.getrusage(resource.RUSAGE_SELF)
         ru_maxrss = usage.ru_maxrss
@@ -73,6 +79,8 @@ def get_self_rss_mb() -> int | None:
 
 def get_self_cpu_seconds() -> float | None:
     """Get CPU time (user + system) of the current process in seconds."""
+    if resource is None:
+        return None
     try:
         usage = resource.getrusage(resource.RUSAGE_SELF)
         return usage.ru_utime + usage.ru_stime
@@ -246,14 +254,14 @@ def get_torch_cuda_mb() -> int | None:
     if "torch" not in sys.modules:
         return None
     try:
-        import torch
+        import torch  # pyright: ignore[reportMissingImports]
 
-        if not torch.cuda.is_available():
+        if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
             return None
         total = 0
-        for i in range(torch.cuda.device_count()):
-            total += torch.cuda.memory_allocated(i)
-        return total // (1024 * 1024)
+        for i in range(torch.cuda.device_count()):  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+            total += torch.cuda.memory_allocated(i)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        return total // (1024 * 1024)  # pyright: ignore[reportUnknownVariableType]
     except Exception:
         return None
 
@@ -263,13 +271,13 @@ def get_torch_cuda_per_gpu_mb() -> dict[int, int]:
     if "torch" not in sys.modules:
         return {}
     try:
-        import torch
+        import torch  # pyright: ignore[reportMissingImports]
 
-        if not torch.cuda.is_available():
+        if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
             return {}
         result: dict[int, int] = {}
-        for i in range(torch.cuda.device_count()):
-            mb = int(torch.cuda.memory_allocated(i)) // (1024 * 1024)
+        for i in range(torch.cuda.device_count()):  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+            mb = int(torch.cuda.memory_allocated(i)) // (1024 * 1024)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
             if mb > 0:
                 result[i] = mb
         return result

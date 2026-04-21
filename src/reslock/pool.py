@@ -33,7 +33,7 @@ class LeaseHandle:
     @property
     def reclaim_requested(self) -> bool:
         """Check the state file for whether reclaim has been requested."""
-        state = read_state(self._pool._path)
+        state = read_state(self._pool._path)  # pyright: ignore[reportPrivateUsage]
         for lease in state.leases:
             if lease.id == self._lease.id:
                 self._lease = lease
@@ -93,7 +93,7 @@ class LeaseHandle:
                         lease.pids = pids
                     break
 
-        transact(self._pool._path, _update)
+        transact(self._pool._path, _update)  # pyright: ignore[reportPrivateUsage]
 
     def release(self) -> None:
         if self._released:
@@ -103,7 +103,7 @@ class LeaseHandle:
         def _release(state: State) -> None:
             state.leases = [ls for ls in state.leases if ls.id != self._lease.id]
 
-        transact(self._pool._path, _release)
+        transact(self._pool._path, _release)  # pyright: ignore[reportPrivateUsage]
 
     def shrink(self, **resources: int) -> None:
         """Atomically decrement reserved resources on this lease.
@@ -160,7 +160,7 @@ class LeaseHandle:
                     should_release.append(True)
                 break
 
-        transact(self._pool._path, _shrink)
+        transact(self._pool._path, _shrink)  # pyright: ignore[reportPrivateUsage]
 
         if should_release:
             self._released = True
@@ -168,7 +168,7 @@ class LeaseHandle:
             def _drop(state: State) -> None:
                 state.leases = [ls for ls in state.leases if ls.id != self._lease.id]
 
-            transact(self._pool._path, _drop)
+            transact(self._pool._path, _drop)  # pyright: ignore[reportPrivateUsage]
 
 
 def _detect_host_pid() -> int | None:

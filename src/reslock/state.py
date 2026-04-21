@@ -79,9 +79,9 @@ def ensure_state_file(path: Path) -> None:
 
 
 def read_state(path: Path) -> State:
-    with portalocker.Lock(str(path), "r", timeout=5) as fh:
-        data = fh.read()
-    return State.model_validate_json(data)
+    with portalocker.Lock(str(path), "r", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
+        data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    return State.model_validate_json(data)  # pyright: ignore[reportUnknownArgumentType]
 
 
 def read_state_clean(path: Path) -> State:
@@ -120,13 +120,13 @@ def transact(path: Path, fn: Callable[[State], T]) -> T:
     and may mutate it. The modified state is written back. The return value of `fn`
     is returned to the caller.
     """
-    with portalocker.Lock(str(path), "r+", timeout=5) as fh:
-        data = fh.read()
-        state = State.model_validate_json(data)
+    with portalocker.Lock(str(path), "r+", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
+        data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        state = State.model_validate_json(data)  # pyright: ignore[reportUnknownArgumentType]
         remove_dead_processes(state)
         result = fn(state)
         new_data = state.model_dump_json(indent=2)
         fh.seek(0)
         fh.truncate()
-        fh.write(new_data)
+        fh.write(new_data)  # pyright: ignore[reportUnknownMemberType]
     return result

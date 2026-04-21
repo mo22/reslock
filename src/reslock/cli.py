@@ -190,7 +190,7 @@ def list_(state: Path | None) -> None:
 
 
 # Register "list" as the CLI command name
-list_.__name__ = "list"
+list_.__name__ = "list"  # pyright: ignore[reportAttributeAccessIssue]
 main.add_command(list_, "list")
 
 
@@ -299,7 +299,7 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
 
         # Resource summary
         if st.resources:
-            res_parts = []
+            res_parts: list[str] = []
             for key, total in st.resources.items():
                 free = st.available.get(key, 0)
                 used = total - free

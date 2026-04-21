@@ -25,7 +25,7 @@ class Lease(BaseModel):
     reclaimable: bool = False
     reclaim_requested: bool = False
     label: str | None = None
-    pids: list[int] = Field(default_factory=list)
+    pids: list[int] = Field(default_factory=list[int])
     actual_resources: dict[str, int] = Field(default_factory=dict)
     cpu_seconds: float | None = None
     progress: float | None = None
@@ -48,8 +48,8 @@ class QueueEntry(BaseModel):
 class State(BaseModel):
     version: int = 1
     resources: dict[str, int] = Field(default_factory=dict)
-    leases: list[Lease] = Field(default_factory=list)
-    queue: list[QueueEntry] = Field(default_factory=list)
+    leases: list[Lease] = Field(default_factory=list[Lease])
+    queue: list[QueueEntry] = Field(default_factory=list[QueueEntry])
 
     model_config = {"extra": "forbid"}
 

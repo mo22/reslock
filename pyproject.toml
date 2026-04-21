@@ -1,6 +1,6 @@
 [project]
 name = "reslock"
-version = "0.4.0"
+version = "0.4.1"
 description = "Resource lock manager for coordinating shared system resources (GPU VRAM, RAM, CPU) across processes"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -76,7 +76,7 @@ known-first-party = ["reslock"]
 [tool.pyright]
 pythonVersion = "3.10"
 typeCheckingMode = "strict"
-ignore = ["**/node_modules", "**/__pycache__"]
+ignore = ["**/node_modules", "**/__pycache__", "examples"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

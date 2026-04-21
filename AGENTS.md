@@ -43,6 +43,12 @@ Do NOT publish manually with `uv publish` — the project uses PyPI trusted publ
 - Per-GPU VRAM tracking for multi-GPU systems (keyed by `gpu0_vram_mb`, `gpu1_vram_mb`, etc.)
 - Priority queue determines which waiter gets resources next
 - Reclaimable leases allow preemption by higher-priority work
+- `LeaseHandle.shrink()` doesn't need its own scheduler hook — waiters in `_acquire_blocking` / `acquire_async` already poll `_try_promote()` every `poll_interval`, so freed capacity is picked up naturally (same as `release()`).
+
+## Platform compatibility
+
+- `resource` (POSIX stdlib) is imported with `try/except ImportError` in `detect.py` — Windows doesn't ship it. `get_self_rss_mb()` and `get_self_cpu_seconds()` return `None` when it's absent; downstream `get_self_actual_resources()` already handles `None` RSS. Regression covered in `tests/test_windows_compat.py` by mocking `builtins.__import__` + `importlib.reload(reslock.detect)` — runs on Linux/macOS CI without needing a Windows runner.
+- Windows consumers (scriba on-prem installs — SCRIBA-308) require `reslock>=0.4.1`.
 
 ## CI/CD Notes
 

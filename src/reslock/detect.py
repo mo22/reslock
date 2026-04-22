@@ -11,17 +11,37 @@ except ImportError:  # pragma: no cover — Windows has no POSIX resource module
     resource = None  # type: ignore[assignment]
 
 
-def detect_gpu_vram_mb() -> dict[str, int]:
-    """Detect per-GPU VRAM via nvidia-smi.
+def gpu_vram_key(gpu_uuid: str) -> str:
+    """Build the reslock resource key for a GPU UUID's VRAM."""
+    return f"gpu_{gpu_uuid}_vram_mb"
 
-    Returns resources like ``{"gpu0_vram_mb": 24000, "gpu1_vram_mb": 24000}``.
+
+def parse_gpu_vram_key(key: str) -> str | None:
+    """Extract the GPU UUID from a ``gpu_{uuid}_vram_mb`` resource key.
+
+    Returns None if the key doesn't match the expected format.
+    """
+    if key.startswith("gpu_") and key.endswith("_vram_mb"):
+        return key[len("gpu_") : -len("_vram_mb")]
+    return None
+
+
+def detect_gpu_vram_mb() -> dict[str, int]:
+    """Detect per-GPU VRAM via nvidia-smi, keyed by host-stable GPU UUID.
+
+    Returns resources like ``{"gpu_GPU-<uuid>_vram_mb": 24000, ...}``.
     Returns empty dict if nvidia-smi is not available or no GPUs found.
+
+    Keying by UUID (instead of nvidia-smi index) keeps coordination correct
+    across containers that get partial GPU mappings from the NVIDIA container
+    runtime — each container sees only its mapped cards renumbered from 0,
+    but UUIDs are stable across the host.
     """
     if not shutil.which("nvidia-smi"):
         return {}
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=uuid,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -32,9 +52,10 @@ def detect_gpu_vram_mb() -> dict[str, int]:
         for line in result.stdout.strip().splitlines():
             parts = line.split(",")
             if len(parts) == 2:
-                idx = int(parts[0].strip())
+                uuid_str = parts[0].strip()
                 mb = int(parts[1].strip())
-                resources[f"gpu{idx}_vram_mb"] = mb
+                if uuid_str:
+                    resources[gpu_vram_key(uuid_str)] = mb
         return resources
     except (subprocess.TimeoutExpired, ValueError, OSError):
         pass
@@ -154,6 +175,78 @@ def _nvidia_smi_gpu_uuid_to_index() -> dict[str, int]:
         return {}
 
 
+_TORCH_INDEX_TO_UUID_CACHE: dict[int, str] = {}
+
+
+def _torch_device_uuid(torch_index: int) -> str | None:
+    """Read a GPU UUID from torch's device properties. Requires torch 2.0+."""
+    if "torch" not in sys.modules:
+        try:
+            import torch  # pyright: ignore[reportMissingImports]  # noqa: F401
+        except ImportError:
+            return None
+    try:
+        import torch  # pyright: ignore[reportMissingImports]
+
+        if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
+            return None
+        if torch_index < 0 or torch_index >= torch.cuda.device_count():  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+            return None
+        props = torch.cuda.get_device_properties(torch_index)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        uuid_obj = getattr(props, "uuid", None)  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType]
+        if uuid_obj is None:
+            return None
+        return f"GPU-{uuid_obj!s}"
+    except Exception:
+        return None
+
+
+def _nvidia_smi_index_to_uuid(torch_index: int) -> str | None:
+    """Fall back to nvidia-smi to find the UUID of a device index."""
+    uuid_to_index = _nvidia_smi_gpu_uuid_to_index()
+    for uuid_str, idx in uuid_to_index.items():
+        if idx == torch_index:
+            return uuid_str
+    return None
+
+
+def gpu_uuid_for_torch_index(torch_index: int) -> str | None:
+    """Return the host-stable GPU UUID for a local torch device index.
+
+    Inside a container with partial GPU mapping, ``torch_index`` is the
+    container-local index (0..N-1 where N is the number of visible cards).
+    The returned UUID is the host's GPU UUID — stable across containers and
+    invariant under NVIDIA container runtime renumbering.
+
+    Returns None if the UUID cannot be determined (no CUDA, index out of
+    range, or neither torch nor nvidia-smi available).
+
+    Results are cached per-process; GPUs don't hot-swap.
+    """
+    if torch_index in _TORCH_INDEX_TO_UUID_CACHE:
+        return _TORCH_INDEX_TO_UUID_CACHE[torch_index]
+    uuid_str = _torch_device_uuid(torch_index)
+    if uuid_str is None:
+        uuid_str = _nvidia_smi_index_to_uuid(torch_index)
+    if uuid_str is not None:
+        _TORCH_INDEX_TO_UUID_CACHE[torch_index] = uuid_str
+    return uuid_str
+
+
+def gpu_resource_key(torch_index: int) -> str | None:
+    """Return the reslock resource key ``gpu_{uuid}_vram_mb`` for a local torch
+    device index, or None if the UUID cannot be determined.
+
+    Inside a container with partial GPU mapping, ``torch_index`` is the
+    container-local index, but the returned key uses the host-stable UUID, so
+    leases coordinate correctly across containers sharing reslock state.
+    """
+    uuid_str = gpu_uuid_for_torch_index(torch_index)
+    if uuid_str is None:
+        return None
+    return gpu_vram_key(uuid_str)
+
+
 def get_pid_vram_mb(pid: int) -> int | None:
     """Get GPU memory usage of a process by PID via nvidia-smi (total across GPUs)."""
     if not shutil.which("nvidia-smi"):
@@ -210,16 +303,13 @@ def get_all_pid_vram_mb() -> dict[int, int]:
         return {}
 
 
-def get_all_pid_vram_per_gpu_mb() -> dict[int, dict[int, int]]:
-    """Get per-GPU memory usage for all processes.
+def get_all_pid_vram_per_gpu_mb() -> dict[int, dict[str, int]]:
+    """Get per-GPU memory usage for all processes, keyed by GPU UUID.
 
-    Returns ``{pid: {gpu_index: mb}}``. Requires two nvidia-smi calls
-    (one for UUID→index mapping, one for per-process usage).
+    Returns ``{pid: {gpu_uuid: mb}}``. GPU UUIDs match the keys emitted by
+    ``detect_gpu_vram_mb()`` (without the ``gpu_``/``_vram_mb`` wrapping).
     """
     if not shutil.which("nvidia-smi"):
-        return {}
-    uuid_map = _nvidia_smi_gpu_uuid_to_index()
-    if not uuid_map:
         return {}
     try:
         result = subprocess.run(
@@ -234,16 +324,16 @@ def get_all_pid_vram_per_gpu_mb() -> dict[int, dict[int, int]]:
         )
         if result.returncode != 0:
             return {}
-        usage: dict[int, dict[int, int]] = {}
+        usage: dict[int, dict[str, int]] = {}
         for line in result.stdout.strip().splitlines():
             parts = line.split(",")
             if len(parts) == 3:
                 pid = int(parts[0].strip())
                 gpu_uuid = parts[1].strip()
                 mb = int(parts[2].strip())
-                gpu_idx = uuid_map.get(gpu_uuid)
-                if gpu_idx is not None:
-                    usage.setdefault(pid, {})[gpu_idx] = usage.get(pid, {}).get(gpu_idx, 0) + mb
+                if gpu_uuid:
+                    per_pid = usage.setdefault(pid, {})
+                    per_pid[gpu_uuid] = per_pid.get(gpu_uuid, 0) + mb
         return usage
     except (subprocess.TimeoutExpired, ValueError, OSError):
         return {}
@@ -266,8 +356,12 @@ def get_torch_cuda_mb() -> int | None:
         return None
 
 
-def get_torch_cuda_per_gpu_mb() -> dict[int, int]:
-    """Get per-GPU CUDA memory allocated by torch. Returns ``{gpu_index: mb}``."""
+def get_torch_cuda_per_gpu_mb() -> dict[str, int]:
+    """Get per-GPU CUDA memory allocated by torch, keyed by GPU UUID.
+
+    Returns ``{gpu_uuid: mb}``. Only includes devices whose UUID is resolvable
+    (via torch properties or nvidia-smi) and whose current allocation is > 0.
+    """
     if "torch" not in sys.modules:
         return {}
     try:
@@ -275,11 +369,15 @@ def get_torch_cuda_per_gpu_mb() -> dict[int, int]:
 
         if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
             return {}
-        result: dict[int, int] = {}
+        result: dict[str, int] = {}
         for i in range(torch.cuda.device_count()):  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
             mb = int(torch.cuda.memory_allocated(i)) // (1024 * 1024)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-            if mb > 0:
-                result[i] = mb
+            if mb <= 0:
+                continue
+            uuid_str = gpu_uuid_for_torch_index(i)
+            if uuid_str is None:
+                continue
+            result[uuid_str] = mb
         return result
     except Exception:
         return {}
@@ -288,7 +386,8 @@ def get_torch_cuda_per_gpu_mb() -> dict[int, int]:
 def get_self_actual_resources() -> dict[str, int]:
     """Detect actual resource usage of the current process.
 
-    Reports per-GPU VRAM as ``gpu0_vram_mb``, ``gpu1_vram_mb``, etc.
+    Reports per-GPU VRAM as ``gpu_{uuid}_vram_mb`` keys, matching the format
+    emitted by ``detect_gpu_vram_mb()``.
     """
     result: dict[str, int] = {}
     rss = get_self_rss_mb()
@@ -297,8 +396,8 @@ def get_self_actual_resources() -> dict[str, int]:
     # Prefer torch CUDA measurement (more accurate, includes tensors)
     per_gpu = get_torch_cuda_per_gpu_mb()
     if per_gpu:
-        for idx, mb in per_gpu.items():
-            result[f"gpu{idx}_vram_mb"] = mb
+        for uuid_str, mb in per_gpu.items():
+            result[gpu_vram_key(uuid_str)] = mb
     else:
         vram = get_pid_vram_mb(os.getpid())
         if vram is not None and vram > 0:

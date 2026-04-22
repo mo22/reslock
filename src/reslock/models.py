@@ -45,8 +45,20 @@ class QueueEntry(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+SCHEMA_VERSION = 2
+"""Current state-file schema version.
+
+Version 2 switched GPU VRAM keys from ``gpu{index}_vram_mb`` (nvidia-smi index)
+to ``gpu_{uuid}_vram_mb`` (host-stable GPU UUID). Index-based keys broke
+coordination across containers with partial GPU mappings, where the NVIDIA
+container runtime renumbers visible devices starting at 0. On reading a file
+with a lower ``version``, ``reslock.state`` drops ``resources``, ``leases``,
+and ``queue`` so consumers repopulate with UUID-keyed entries.
+"""
+
+
 class State(BaseModel):
-    version: int = 1
+    version: int = SCHEMA_VERSION
     resources: dict[str, int] = Field(default_factory=dict)
     leases: list[Lease] = Field(default_factory=list[Lease])
     queue: list[QueueEntry] = Field(default_factory=list[QueueEntry])

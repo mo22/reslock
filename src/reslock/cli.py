@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import re
 import signal
 import subprocess
@@ -22,6 +21,8 @@ from reslock.detect import (
     get_all_pid_vram_per_gpu_mb,
     get_pid_cpu_seconds,
     get_pid_rss_mb,
+    gpu_resource_key,
+    parse_gpu_vram_key,
 )
 from reslock.models import State
 from reslock.pool import ResourcePool
@@ -95,14 +96,29 @@ def set_resource(resource: str, value: int, state: Path | None) -> None:
     console.print(f"[green]Set[/green] {resource} = {value}")
 
 
+def _shorten_resource_key(key: str) -> str:
+    """Trim the UUID portion of a ``gpu_{uuid}_vram_mb`` key to its last 8 chars."""
+    uuid_str = parse_gpu_vram_key(key)
+    if uuid_str is None or len(uuid_str) <= 8:
+        return key
+    return f"gpu_…{uuid_str[-8:]}_vram_mb"
+
+
 @main.command()
 @click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
-def status(state: Path | None) -> None:
+@click.option("--short", is_flag=True, help="Abbreviate GPU UUIDs to the last 8 chars")
+def status(state: Path | None, short: bool) -> None:
     """Show current resource status, leases, and queue."""
     path = state or DEFAULT_STATE_PATH
     ensure_state_file(path)
     pool = ResourcePool(path)
     st = pool.status()
+
+    def _fmt_key(key: str) -> str:
+        return _shorten_resource_key(key) if short else key
+
+    def _fmt_resources(res: dict[str, int]) -> str:
+        return ", ".join(f"{_fmt_key(k)}={v}" for k, v in res.items())
 
     if st.resources:
         table = Table(title="Resources")
@@ -113,7 +129,7 @@ def status(state: Path | None) -> None:
         for key, total in st.resources.items():
             free = st.available.get(key, 0)
             used = total - free
-            table.add_row(key, str(total), str(used), str(free))
+            table.add_row(_fmt_key(key), str(total), str(used), str(free))
         console.print(table)
     else:
         console.print(
@@ -134,7 +150,7 @@ def status(state: Path | None) -> None:
             age = now - lease.acquired_at
             mins = int(age.total_seconds()) // 60
             age_str = f"{mins}m ago" if mins > 0 else f"{int(age.total_seconds())}s ago"
-            res_str = ", ".join(f"{k}={v}" for k, v in lease.resources.items())
+            res_str = _fmt_resources(lease.resources)
             flags: list[str] = []
             if lease.reclaimable:
                 flags.append("reclaimable")
@@ -164,7 +180,7 @@ def status(state: Path | None) -> None:
             age = now - e.queued_at
             secs = int(age.total_seconds())
             queued_str = f"{secs // 60}m ago" if secs >= 60 else f"{secs}s ago"
-            res_str = ", ".join(f"{k}={v}" for k, v in e.resources.items())
+            res_str = _fmt_resources(e.resources)
             table.add_row(e.id, str(e.pid), res_str, str(e.priority), e.label or "", queued_str)
         console.print(table)
 
@@ -267,13 +283,13 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
         lease_rss: dict[str, int] = {}
         lease_cpu: dict[str, float] = {}
         lease_vram: dict[str, int] = {}
-        lease_vram_per_gpu: dict[str, dict[int, int]] = {}
+        lease_vram_per_gpu: dict[str, dict[str, int]] = {}
         for lease in st.leases:
             all_pids = [lease.pid, *lease.pids]
             rss_total = 0
             cpu_total = 0.0
             vram_total = 0
-            per_gpu: dict[int, int] = {}
+            per_gpu: dict[str, int] = {}
             for pid in all_pids:
                 rss = get_pid_rss_mb(pid)
                 if rss:
@@ -282,8 +298,8 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
                 if cpu:
                     cpu_total += cpu
                 vram_total += pid_vram.get(pid, 0)
-                for gpu_idx, mb in pid_vram_per_gpu.get(pid, {}).items():
-                    per_gpu[gpu_idx] = per_gpu.get(gpu_idx, 0) + mb
+                for gpu_uuid, mb in pid_vram_per_gpu.get(pid, {}).items():
+                    per_gpu[gpu_uuid] = per_gpu.get(gpu_uuid, 0) + mb
             if rss_total:
                 lease_rss[lease.id] = rss_total
             if cpu_total:
@@ -334,17 +350,22 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
                 else:
                     age_str = f"{secs}s"
 
-                alloc_str = ", ".join(f"{k}={v}" for k, v in lease.resources.items())
+                alloc_str = ", ".join(
+                    f"{_shorten_resource_key(k)}={v}" for k, v in lease.resources.items()
+                )
 
                 # Actual resources: prefer self-reported, fall back to measured
                 actual_parts: list[str] = []
                 if lease.actual_resources:
-                    actual_parts = [f"{k}={v}" for k, v in lease.actual_resources.items()]
+                    actual_parts = [
+                        f"{_shorten_resource_key(k)}={v}" for k, v in lease.actual_resources.items()
+                    ]
                 else:
                     per_gpu = lease_vram_per_gpu.get(lease.id, {})
                     if per_gpu:
-                        for gpu_idx in sorted(per_gpu):
-                            actual_parts.append(f"gpu{gpu_idx}={per_gpu[gpu_idx]}")
+                        for gpu_uuid in sorted(per_gpu):
+                            short_uuid = gpu_uuid[-8:] if len(gpu_uuid) > 8 else gpu_uuid
+                            actual_parts.append(f"gpu…{short_uuid}={per_gpu[gpu_uuid]}")
                     elif lease_vram.get(lease.id):
                         actual_parts.append(f"vram={lease_vram[lease.id]}")
                 actual_str = ", ".join(actual_parts) if actual_parts else "-"
@@ -352,12 +373,10 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
                 # Check for overuse
                 for key, val in lease.resources.items():
                     actual_val = lease.actual_resources.get(key)
-                    if actual_val is None and key.startswith("gpu") and key.endswith("_vram_mb"):
-                        # Try measured per-GPU VRAM
-                        gpu_idx_str = key[3 : key.index("_")]
-                        per_gpu = lease_vram_per_gpu.get(lease.id, {})
-                        with contextlib.suppress(ValueError):
-                            actual_val = per_gpu.get(int(gpu_idx_str))
+                    if actual_val is None:
+                        uuid_from_key = parse_gpu_vram_key(key)
+                        if uuid_from_key is not None:
+                            actual_val = lease_vram_per_gpu.get(lease.id, {}).get(uuid_from_key)
                     if actual_val is not None and actual_val > val:
                         actual_str = f"[red]{actual_str}[/red]"
                         break
@@ -460,14 +479,28 @@ def run(
     With --reclaimable, the lease can be reclaimed by higher-priority requests.
     When reclaim is requested, the specified signal is sent to the child process.
     """
+
+    def _gpu_key_for_index(index: int) -> str:
+        key = gpu_resource_key(index)
+        if key is None:
+            raise click.BadParameter(
+                f"Could not resolve GPU UUID for torch index {index}. "
+                "Install torch (>=2.0) or ensure nvidia-smi is on PATH."
+            )
+        return key
+
     resources: dict[str, int] = {}
     if vram:
-        resources["gpu0_vram_mb"] = _parse_size(vram)
+        resources[_gpu_key_for_index(0)] = _parse_size(vram)
     for spec in gpu_vram:
         if ":" not in spec:
             raise click.BadParameter(f"Expected INDEX:SIZE, got: {spec}")
         idx_str, size_str = spec.split(":", 1)
-        resources[f"gpu{idx_str}_vram_mb"] = _parse_size(size_str)
+        try:
+            idx = int(idx_str)
+        except ValueError as exc:
+            raise click.BadParameter(f"GPU index must be an integer: {idx_str}") from exc
+        resources[_gpu_key_for_index(idx)] = _parse_size(size_str)
     if ram:
         resources["ram_mb"] = _parse_size(ram)
     if cpu:

@@ -11,10 +11,31 @@ from typing import TypeVar
 import portalocker
 
 from reslock.cleanup import has_dead_processes, remove_dead_processes
-from reslock.models import State
+from reslock.models import SCHEMA_VERSION, State
 
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
+
+
+def _load_state(data: str) -> State:
+    """Parse state JSON and migrate across schema versions.
+
+    Schema version 2 changed GPU VRAM keys from index-based (``gpu0_vram_mb``)
+    to UUID-based (``gpu_GPU-<uuid>_vram_mb``). Older snapshots are dropped —
+    ``resources``, ``leases``, and ``queue`` are reset — so the next
+    ``set_resources()`` / ``acquire()`` calls repopulate with UUID keys.
+    Dead PID cleanup handles stale process entries separately.
+    """
+    state = State.model_validate_json(data)
+    if state.version != SCHEMA_VERSION:
+        logger.warning(
+            "reslock state schema v%d detected (expected v%d) — resetting "
+            "resources, leases, and queue. Consumers must re-register resources.",
+            state.version,
+            SCHEMA_VERSION,
+        )
+        return State()
+    return state
 
 
 def _default_state_path() -> Path:
@@ -81,7 +102,7 @@ def ensure_state_file(path: Path) -> None:
 def read_state(path: Path) -> State:
     with portalocker.Lock(str(path), "r", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
         data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-    return State.model_validate_json(data)  # pyright: ignore[reportUnknownArgumentType]
+    return _load_state(data)  # pyright: ignore[reportUnknownArgumentType]
 
 
 def read_state_clean(path: Path) -> State:
@@ -122,7 +143,7 @@ def transact(path: Path, fn: Callable[[State], T]) -> T:
     """
     with portalocker.Lock(str(path), "r+", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
         data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        state = State.model_validate_json(data)  # pyright: ignore[reportUnknownArgumentType]
+        state = _load_state(data)  # pyright: ignore[reportUnknownArgumentType]
         remove_dead_processes(state)
         result = fn(state)
         new_data = state.model_dump_json(indent=2)

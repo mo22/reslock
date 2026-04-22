@@ -40,7 +40,8 @@ Do NOT publish manually with `uv publish` — the project uses PyPI trusted publ
 - File locks are held only during reads/writes, not for lease duration
 - `read_state()` uses shared lock (`portalocker "r"`), `transact()` uses exclusive lock (`"r+"`) — read-heavy workloads don't block each other
 - Dead processes cleaned up automatically via PID checking; a lease is alive if owner PID OR any child PID in `lease.pids` is alive
-- Per-GPU VRAM tracking for multi-GPU systems (keyed by `gpu0_vram_mb`, `gpu1_vram_mb`, etc.)
+- Per-GPU VRAM tracking for multi-GPU systems. Keys are UUID-based: `gpu_{UUID}_vram_mb` (e.g. `gpu_GPU-1a2b3c4d-..._vram_mb`). Keying by the host-stable GPU UUID (not nvidia-smi index) keeps coordination correct across containers with partial GPU mappings — the NVIDIA container runtime renumbers visible devices from 0, but UUIDs are invariant. Consumers that hold a local torch index should use `reslock.gpu_resource_key(i)` to build the key.
+- State-file schema version: `2` (bumped from `1` in v0.5.0 when GPU keys switched to UUIDs). On read, files with a different `version` are reset — `resources`, `leases`, `queue` are all cleared so consumers repopulate with UUID keys. Upgrade procedure: stop all reslock consumers on a host, delete `state.json`, redeploy with matching versions.
 - Priority queue determines which waiter gets resources next
 - Reclaimable leases allow preemption by higher-priority work
 - `LeaseHandle.shrink()` doesn't need its own scheduler hook — waiters in `_acquire_blocking` / `acquire_async` already poll `_try_promote()` every `poll_interval`, so freed capacity is picked up naturally (same as `release()`).

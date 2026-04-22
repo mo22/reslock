@@ -287,7 +287,7 @@ class ResourcePool:
 
         Args:
             resources: Mapping of resource name to total capacity,
-                e.g. ``{"gpu0_vram_mb": 24000, "cpu_cores": 16}``.
+                e.g. ``{"gpu_GPU-1a2b3c4d-..._vram_mb": 24000, "cpu_cores": 16}``.
         """
 
         def _set(state: State) -> None:

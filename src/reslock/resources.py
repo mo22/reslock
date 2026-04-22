@@ -13,18 +13,24 @@ import shutil
 import subprocess
 import sys
 
+from reslock.detect import gpu_vram_key
+
 # ---------------------------------------------------------------------------
 # GPU VRAM
 # ---------------------------------------------------------------------------
 
 
 def detect_gpu_vram_mb() -> dict[str, int]:
-    """Detect per-GPU total VRAM.
+    """Detect per-GPU total VRAM, keyed by host-stable GPU UUID.
 
     Tries torch first (works inside containers without nvidia-smi),
     falls back to nvidia-smi CLI.
 
-    Returns ``{"gpu0_vram_mb": 24000, "gpu1_vram_mb": 24000, ...}``.
+    Returns ``{"gpu_GPU-<uuid>_vram_mb": 24000, ...}``. UUIDs are the
+    host-stable identifiers reported by nvidia-smi / CUDA, so two containers
+    with partial GPU mappings that share a reslock state file coordinate
+    correctly on the same physical card.
+
     Returns an empty dict if no GPUs are detected.
     """
     result = detect_gpu_vram_mb_torch()
@@ -34,9 +40,11 @@ def detect_gpu_vram_mb() -> dict[str, int]:
 
 
 def detect_gpu_vram_mb_torch() -> dict[str, int]:
-    """Detect per-GPU total VRAM using torch.
+    """Detect per-GPU total VRAM using torch, keyed by GPU UUID.
 
-    Returns an empty dict if torch or CUDA is unavailable.
+    Requires torch >= 2.0 for the ``get_device_properties(i).uuid`` attribute.
+    Returns an empty dict if torch or CUDA is unavailable, or if the UUID
+    attribute is missing (older torch).
     """
     try:
         import torch  # pyright: ignore[reportMissingImports]
@@ -48,12 +56,15 @@ def detect_gpu_vram_mb_torch() -> dict[str, int]:
     for i in range(torch.cuda.device_count()):  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
         props = torch.cuda.get_device_properties(i)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         total = getattr(props, "total_memory", None) or props.total_mem  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportUnknownArgumentType]
-        resources[f"gpu{i}_vram_mb"] = total // (1024 * 1024)  # pyright: ignore[reportUnknownArgumentType]
+        uuid_obj = getattr(props, "uuid", None)  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType]
+        if uuid_obj is None:
+            return {}
+        resources[gpu_vram_key(f"GPU-{uuid_obj!s}")] = total // (1024 * 1024)  # pyright: ignore[reportUnknownArgumentType]
     return resources
 
 
 def detect_gpu_vram_mb_nvidia_smi() -> dict[str, int]:
-    """Detect per-GPU total VRAM by shelling out to nvidia-smi.
+    """Detect per-GPU total VRAM by shelling out to nvidia-smi, keyed by UUID.
 
     Useful when torch is not installed (e.g. a proxy or orchestrator
     that coordinates GPU work but doesn't load models itself).
@@ -62,7 +73,7 @@ def detect_gpu_vram_mb_nvidia_smi() -> dict[str, int]:
         return {}
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=uuid,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -73,9 +84,10 @@ def detect_gpu_vram_mb_nvidia_smi() -> dict[str, int]:
         for line in result.stdout.strip().splitlines():
             parts = line.split(",")
             if len(parts) == 2:
-                idx = int(parts[0].strip())
+                uuid_str = parts[0].strip()
                 mb = int(parts[1].strip())
-                resources[f"gpu{idx}_vram_mb"] = mb
+                if uuid_str:
+                    resources[gpu_vram_key(uuid_str)] = mb
         return resources
     except (subprocess.TimeoutExpired, ValueError, OSError):
         return {}

@@ -21,6 +21,8 @@ class Lease(BaseModel):
     resources: dict[str, int]
     priority: int = 0
     acquired_at: datetime = Field(default_factory=_utcnow)
+    queued_at: datetime | None = None
+    wait_sec: float | None = None
     estimated_seconds: int | None = None
     reclaimable: bool = False
     reclaim_requested: bool = False

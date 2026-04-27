@@ -8,6 +8,7 @@ import pytest
 
 from reslock import ResourcePool
 from reslock.models import Lease, State
+from reslock.pool import LeaseHandle
 from reslock.state import read_state, transact
 
 
@@ -196,6 +197,78 @@ def test_shrink_after_release_is_noop(tmp_path: Path) -> None:
     # No exception, no state change.
     lease.shrink(disk_mb=1000)
     assert pool.status().available["disk_mb"] == 5000
+
+
+def test_try_acquire_wait_sec_zero(tmp_path: Path) -> None:
+    """try_acquire skips the queue path, so wait_sec is exactly 0.0."""
+    pool = _make_pool(tmp_path, vram_mb=8000)
+    lease = pool.try_acquire(vram_mb=4000)
+    assert lease is not None
+    assert lease.wait_sec == 0.0
+    lease.release()
+
+
+def test_acquire_wait_sec_reflects_queue_time(tmp_path: Path) -> None:
+    """Waiters promoted from the queue see wait_sec ≥ time spent blocked."""
+    pool = _make_pool(tmp_path, vram_mb=8000)
+    holder = pool.try_acquire(vram_mb=8000)
+    assert holder is not None
+
+    poll_interval = 0.05
+    block_seconds = 0.3
+    waiter_handle: list[LeaseHandle] = []
+
+    def _waiter() -> None:
+        h = pool._acquire_blocking(  # pyright: ignore[reportPrivateUsage]
+            resources={"vram_mb": 4000},
+            priority=0,
+            estimated_seconds=None,
+            reclaimable=False,
+            label=None,
+            poll_interval=poll_interval,
+        )
+        waiter_handle.append(h)
+
+    t = threading.Thread(target=_waiter)
+    t.start()
+    try:
+        time.sleep(block_seconds)
+        holder.release()
+        t.join(timeout=2.0)
+        assert waiter_handle, "waiter never acquired"
+        h = waiter_handle[0]
+        assert h.wait_sec is not None
+        assert h.wait_sec >= block_seconds * 0.8  # some slack for timing
+    finally:
+        for h in waiter_handle:
+            h.release()
+
+
+def test_lease_handle_gpu_uuids(tmp_path: Path) -> None:
+    """gpu_uuids parses GPU UUIDs out of `gpu_{uuid}_vram_mb` resource keys."""
+    from reslock.pool import LeaseHandle as _LeaseHandle
+
+    uuid_a = "GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"
+    uuid_b = "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    pool = ResourcePool(tmp_path / "state.json")
+    lease = Lease(
+        pid=1,
+        resources={
+            f"gpu_{uuid_a}_vram_mb": 8000,
+            f"gpu_{uuid_b}_vram_mb": 8000,
+            "ram_mb": 1000,
+        },
+    )
+    handle = _LeaseHandle(lease, pool)
+    assert sorted(handle.gpu_uuids) == sorted([uuid_a, uuid_b])
+
+
+def test_lease_handle_gpu_uuids_empty_without_gpu_keys(tmp_path: Path) -> None:
+    pool = _make_pool(tmp_path, vram_mb=8000)
+    lease = pool.try_acquire(vram_mb=4000)
+    assert lease is not None
+    assert lease.gpu_uuids == []
+    lease.release()
 
 
 def test_shrink_promotes_queued_waiter(tmp_path: Path) -> None:

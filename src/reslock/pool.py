@@ -5,6 +5,7 @@ import os
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from reslock.detect import get_host_pid, get_self_actual_resources, get_self_cpu_seconds
@@ -18,6 +19,10 @@ from reslock.state import (
 )
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class LeaseHandle:
     """Handle for an acquired lease, used to update or release it."""
 
@@ -29,6 +34,54 @@ class LeaseHandle:
     @property
     def id(self) -> str:
         return self._lease.id
+
+    @property
+    def wait_sec(self) -> float | None:
+        """Seconds spent in the queue before this lease was promoted.
+
+        ``0.0`` for leases acquired via ``try_acquire`` (no queue path).
+        ``None`` only for leases recovered from a state file written by an
+        older reslock version that didn't record this field.
+        """
+        return self._lease.wait_sec
+
+    @property
+    def gpu_uuids(self) -> list[str]:
+        """Host-stable GPU UUIDs the lease reserves VRAM on.
+
+        Parsed from the lease's ``gpu_{uuid}_vram_mb`` resource keys. Empty
+        when the lease holds no per-GPU VRAM reservations.
+        """
+        from reslock.detect import parse_gpu_vram_key
+
+        return [u for u in (parse_gpu_vram_key(k) for k in self._lease.resources) if u]
+
+    @property
+    def gpu_torch_indices(self) -> list[int]:
+        """Container-local torch device indices, derived from ``gpu_uuids``.
+
+        Inside a container with partial GPU mapping, torch numbers visible
+        devices from 0; this property returns those local indices for the
+        UUIDs the lease holds. Returns an empty list when CUDA isn't
+        available, no UUIDs resolve, or torch isn't installed.
+        """
+        try:
+            import torch  # pyright: ignore[reportMissingImports]
+        except ImportError:
+            return []
+        try:
+            if not torch.cuda.is_available():  # pyright: ignore[reportUnknownMemberType]
+                return []
+            from reslock.detect import gpu_uuid_for_torch_index
+
+            uuid_to_index: dict[str, int] = {}
+            for i in range(torch.cuda.device_count()):  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                uid = gpu_uuid_for_torch_index(i)
+                if uid:
+                    uuid_to_index[uid] = i
+            return sorted({uuid_to_index[u] for u in self.gpu_uuids if u in uuid_to_index})
+        except Exception:
+            return []
 
     @property
     def reclaim_requested(self) -> bool:
@@ -258,11 +311,15 @@ class ResourcePool:
         def _try(state: State) -> None:
             if not state.can_fit(resources):
                 return
+            now = _utcnow()
             lease = Lease(
                 pid=pid,
                 host_pid=host_pid,
                 resources=resources,
                 priority=priority,
+                acquired_at=now,
+                queued_at=now,
+                wait_sec=0.0,
                 estimated_seconds=estimated_seconds,
                 reclaimable=reclaimable,
                 label=label,
@@ -352,8 +409,12 @@ class ResourcePool:
 
         def _promote(state: State) -> None:
             # Check if we're still in queue
-            in_queue = any(e.id == queue_id for e in state.queue)
-            if not in_queue:
+            own_entry: QueueEntry | None = None
+            for e in state.queue:
+                if e.id == queue_id:
+                    own_entry = e
+                    break
+            if own_entry is None:
                 return
 
             # Check if higher-priority waiters should go first
@@ -364,11 +425,16 @@ class ResourcePool:
                     return  # higher priority waiter can fit, let them go first
 
             if state.can_fit(resources):
+                acquired_at = _utcnow()
+                wait_sec = (acquired_at - own_entry.queued_at).total_seconds()
                 lease = Lease(
                     pid=pid,
                     host_pid=host_pid,
                     resources=resources,
                     priority=priority,
+                    acquired_at=acquired_at,
+                    queued_at=own_entry.queued_at,
+                    wait_sec=wait_sec,
                     estimated_seconds=estimated_seconds,
                     reclaimable=reclaimable,
                     label=label,

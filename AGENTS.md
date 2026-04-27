@@ -45,6 +45,7 @@ Do NOT publish manually with `uv publish` — the project uses PyPI trusted publ
 - Priority queue determines which waiter gets resources next
 - Reclaimable leases allow preemption by higher-priority work
 - `LeaseHandle.shrink()` doesn't need its own scheduler hook — waiters in `_acquire_blocking` / `acquire_async` already poll `_try_promote()` every `poll_interval`, so freed capacity is picked up naturally (same as `release()`).
+- `Lease.queued_at` / `Lease.wait_sec` (added in v0.6.0) are stamped at promotion time so consumers can split "queued behind reslock" from "running on GPU" without timing the acquire themselves. `try_acquire` records `wait_sec=0.0` (no queue path); `_try_promote` computes `acquired_at - queued_at`. `LeaseHandle.gpu_uuids` and `LeaseHandle.gpu_torch_indices` derive GPU device lists from the lease's `gpu_{uuid}_vram_mb` keys (the latter is empty when CUDA/torch isn't available). Schema version stays at 2 because the new fields are additive `Optional[...] = None`, but `Lease.model_config = {"extra": "forbid"}` means a 0.5.x reader will reject a state file written by 0.6.0 — upgrade all consumers on a host together.
 
 ## Platform compatibility
 

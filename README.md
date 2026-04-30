@@ -25,7 +25,7 @@ pip install reslock
 ```python
 from reslock import ResourcePool
 
-pool = ResourcePool()  # uses ~/.reslock/state.json
+pool = ResourcePool()  # uses /var/lib/reslock/state.json (falls back to ~/.reslock if /var/lib is not writable)
 
 # Context manager — blocks until resources are available
 with pool.acquire(vram_mb=4000, priority=5, label="whisper") as lease:
@@ -155,7 +155,20 @@ A process can mark its lease as **reclaimable** — "I'm using this, but can giv
 
 ## Docker
 
-Containers need access to the shared state file. Mount it (and its directory) from the host:
+Containers need access to the shared state file. Reslock's default state directory is `/var/lib/reslock` (mode `1777`, world-writable + sticky bit like `/tmp`); mount that path 1:1 from the host:
+
+```bash
+docker run --pid=host \
+  -v /var/lib/reslock:/var/lib/reslock \
+  my-gpu-app
+```
+
+- **`--pid=host`** — Required so the host can check container PIDs for dead-process cleanup. Without it, container PIDs are invisible to the host and leases won't be cleaned up when containers exit.
+- **`-v /var/lib/reslock:/var/lib/reslock`** — Mounts the canonical state file directory. All containers and the host share the same `state.json`. The path inside the container must match where reslock will look — using the same path on host and container is the simplest setup.
+
+**Multi-user:** The state directory is created with mode `1777` (world-writable + sticky bit, like `/tmp`) and the state file with mode `666`, so multiple containers running as different UIDs can share it without permission issues.
+
+If `/var/lib/reslock` isn't writable in your environment (e.g. read-only host filesystem, hosts you don't own), reslock falls back to `~/.reslock`. Mount that path instead — adjusting the in-container side to match the user reslock runs as:
 
 ```bash
 docker run --pid=host \
@@ -163,20 +176,7 @@ docker run --pid=host \
   my-gpu-app
 ```
 
-- **`--pid=host`** — Required so the host can check container PIDs for dead-process cleanup. Without it, container PIDs are invisible to the host and leases won't be cleaned up when containers exit.
-- **`-v ~/.reslock:/root/.reslock`** — Mounts the state file directory. All containers and the host share the same `state.json`. The mount path inside the container must match the `state_path` used by reslock (default: `~/.reslock/state.json`).
-
-**Multi-user:** The state directory is created with mode `1777` (world-writable + sticky bit, like `/tmp`) and the state file with mode `666`, so multiple containers running as different UIDs can share it without permission issues.
-
-If your container runs as a non-root user, mount to that user's home directory instead:
-
-```bash
-docker run --pid=host \
-  -v ~/.reslock:/home/appuser/.reslock \
-  my-gpu-app
-```
-
-Or use a custom state path shared between host and containers:
+Or override the path explicitly via `RESLOCK_DIR` or `state_path=`:
 
 ```python
 # Both host and container code use the same explicit path

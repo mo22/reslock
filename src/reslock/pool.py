@@ -10,6 +10,12 @@ from pathlib import Path
 
 from reslock.detect import get_host_pid, get_self_actual_resources, get_self_cpu_seconds
 from reslock.models import Lease, PoolStatus, QueueEntry, State
+from reslock.nvml import (
+    NvmlUnavailableError,
+    compute_nvml_shortfall,
+    nvml_free_vram_mb,
+    request_uses_gpu_vram,
+)
 from reslock.state import (
     DEFAULT_STATE_PATH,
     ensure_state_file,
@@ -17,6 +23,23 @@ from reslock.state import (
     read_state_clean,
     transact,
 )
+
+
+def _read_nvml_for_request(resources: dict[str, int]) -> dict[str, int] | None:
+    """Read NVML free VRAM only when the request includes GPU keys.
+
+    Returns ``{gpu_uuid: free_mb}`` for the driver's view, or ``None`` when no
+    GPU keys are in the request (skip pre-flight entirely).
+
+    Raises ``NvmlUnavailableError`` from :mod:`reslock.nvml` when GPU keys are
+    requested but pynvml is missing or ``nvmlInit()`` fails — by design, since
+    a CUDA-capable host with a broken NVML install would otherwise silently
+    fall back to internal-accounting-only and reintroduce the
+    accounting-vs-driver drift the pre-flight is meant to catch.
+    """
+    if not request_uses_gpu_vram(resources):
+        return None
+    return nvml_free_vram_mb()
 
 
 def _utcnow() -> datetime:
@@ -308,8 +331,19 @@ class ResourcePool:
         host_pid = self._host_pid
         result: list[LeaseHandle] = []
 
+        # NVML pre-flight: read driver-side free VRAM before we take the file
+        # lock, so the transact closure stays fast. Raises if the request uses
+        # GPU keys and pynvml is unavailable (intentional hard fail).
+        nvml_free = _read_nvml_for_request(resources)
+
         def _try(state: State) -> None:
             if not state.can_fit(resources):
+                return
+            # Driver disagrees with internal accounting — refuse this try. A
+            # blocking ``acquire`` would request reclaim instead; try_acquire
+            # is non-blocking by contract, so the caller decides whether to
+            # retry.
+            if nvml_free is not None and compute_nvml_shortfall(resources, nvml_free):
                 return
             now = _utcnow()
             lease = Lease(
@@ -407,7 +441,20 @@ class ResourcePool:
         host_pid = self._host_pid
         result: list[LeaseHandle] = []
 
+        # NVML pre-flight: read driver-side free VRAM before we take the file
+        # lock. Raises if pynvml is unavailable and the request uses GPU keys.
+        nvml_free = _read_nvml_for_request(resources)
+
+        # Lazy NVML snapshot for the priority gate — populated on first need
+        # (when a higher-pri queued entry uses GPU keys and we don't already
+        # have ``nvml_free`` from our own request). ``False`` is the
+        # "tried and pynvml is unavailable" sentinel so we don't re-attempt.
+        nvml_for_gate: dict[str, int] | None = nvml_free
+        nvml_gate_unreachable = False
+
         def _promote(state: State) -> None:
+            nonlocal nvml_for_gate, nvml_gate_unreachable
+
             # Check if we're still in queue
             own_entry: QueueEntry | None = None
             for e in state.queue:
@@ -417,14 +464,42 @@ class ResourcePool:
             if own_entry is None:
                 return
 
-            # Check if higher-priority waiters should go first
+            # Check if higher-priority waiters should go first. A higher-pri
+            # entry only blocks us if it could *actually* be promoted on its
+            # own next tick — i.e. it must pass both internal accounting and
+            # the NVML pre-flight that ``_promote`` itself uses. Otherwise an
+            # NVML-short GPU waiter would silently block lower-priority
+            # non-GPU waiters forever (the priority gate's old behavior).
             for entry in state.queue:
                 if entry.id == queue_id:
                     break
-                if entry.priority > priority and state.can_fit(entry.resources):
-                    return  # higher priority waiter can fit, let them go first
+                if entry.priority <= priority:
+                    continue
+                if not state.can_fit(entry.resources):
+                    continue
+                if request_uses_gpu_vram(entry.resources):
+                    if nvml_for_gate is None and not nvml_gate_unreachable:
+                        try:
+                            nvml_for_gate = nvml_free_vram_mb()
+                        except NvmlUnavailableError:
+                            nvml_gate_unreachable = True
+                    if nvml_gate_unreachable:
+                        # NVML unreachable for the gate; be conservative and
+                        # let the higher-pri entry block us (legacy behavior).
+                        return
+                    assert nvml_for_gate is not None
+                    if compute_nvml_shortfall(entry.resources, nvml_for_gate):
+                        # Higher-pri entry can't actually be promoted because
+                        # NVML reports the GPU is short — skip it as a blocker.
+                        continue
+                return  # higher priority waiter can fit, let them go first
 
-            if state.can_fit(resources):
+            internal_fit = state.can_fit(resources)
+            nvml_short: dict[str, int] = {}
+            if nvml_free is not None:
+                nvml_short = compute_nvml_shortfall(resources, nvml_free)
+
+            if internal_fit and not nvml_short:
                 acquired_at = _utcnow()
                 wait_sec = (acquired_at - own_entry.queued_at).total_seconds()
                 lease = Lease(
@@ -442,12 +517,33 @@ class ResourcePool:
                 state.leases.append(lease)
                 state.queue = [e for e in state.queue if e.id != queue_id]
                 result.append(LeaseHandle(lease, self))
-            else:
-                # Try reclaiming
-                to_reclaim = state.reclaimable_for(resources)
-                if to_reclaim:
-                    for lease in to_reclaim:
-                        lease.reclaim_requested = True
+                return
+
+            # Either internal accounting is short OR NVML disagrees. Combine
+            # both deficits per-key (worst-case wins) and ask the existing
+            # reclaim machinery to pick reclaimable leases that together cover
+            # the gap. Reclaim requests are advisory — consumers cooperate via
+            # ``LeaseHandle.reclaim_requested`` and release on their own terms.
+            avail = state.available()
+            combined: dict[str, int] = {}
+            for key, val in resources.items():
+                deficit = val - avail.get(key, 0)
+                if deficit > 0:
+                    combined[key] = deficit
+            for key, deficit in nvml_short.items():
+                if deficit > combined.get(key, 0):
+                    combined[key] = deficit
+
+            # When the gap is purely internal accounting, strict mode avoids
+            # pointless churn: state.can_fit is deterministic so a partial
+            # eviction won't promote the waiter. When NVML drives part of the
+            # shortfall the external consumer is opaque to us — evict what we
+            # can to recover *some* headroom even if it doesn't fully cover.
+            partial = bool(nvml_short)
+            to_reclaim = state.reclaimable_for_shortfall(combined, partial=partial)
+            if to_reclaim:
+                for lease in to_reclaim:
+                    lease.reclaim_requested = True
 
         transact(self._path, _promote)
         return result[0] if result else None

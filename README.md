@@ -17,8 +17,15 @@ Multiple GPU-consuming processes (llama.cpp, whisper, vLLM, training jobs) compe
 ## Install
 
 ```bash
-pip install reslock
+pip install reslock           # core
+pip install reslock[cuda]     # adds nvidia-ml-py for the GPU pre-flight check
 ```
+
+The `cuda` extra is required on machines that issue GPU VRAM leases (any
+`gpu_<uuid>_vram_mb` resource key). reslock cross-checks its internal lease
+accounting against the NVIDIA driver before granting a GPU lease, and hard-
+fails if `pynvml` / `nvmlInit()` are unavailable on a CUDA host — silent
+fallback to state-file-only accounting would defeat the purpose.
 
 ## Python API
 

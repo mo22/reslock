@@ -9,6 +9,7 @@ Resource lock manager for coordinating shared system resources (GPU VRAM, RAM, C
   - `models.py` — Pydantic models (`State`, `Lease`, `QueueEntry`, `PoolStatus`)
   - `state.py` — file-locked state read/write
   - `detect.py` — system resource detection (GPU VRAM via nvidia-smi/torch, CPU, disk)
+  - `nvml.py` — pynvml pre-flight (driver-side free VRAM ground truth, hard-fails on CUDA hosts without pynvml)
   - `resources.py` — public detection API (re-exports from detect.py)
   - `cleanup.py` — dead-PID lease cleanup
   - `cli.py` — Click CLI (`reslock status`, `reslock acquire`, etc.)
@@ -44,6 +45,7 @@ Do NOT publish manually with `uv publish` — the project uses PyPI trusted publ
 - State-file schema version: `2` (bumped from `1` in v0.5.0 when GPU keys switched to UUIDs). On read, files with a different `version` are reset — `resources`, `leases`, `queue` are all cleared so consumers repopulate with UUID keys. Upgrade procedure: stop all reslock consumers on a host, delete `state.json`, redeploy with matching versions.
 - Priority queue determines which waiter gets resources next
 - Reclaimable leases allow preemption by higher-priority work
+- NVML pre-flight (v0.7.0+, `nvml.py`): on every GPU VRAM acquire, reslock reads driver-reported free VRAM via pynvml and compares against the request. If the driver disagrees with internal lease accounting (typically because a process holds VRAM without a registered lease — see SCRIBA-325), reslock either refuses (`try_acquire`) or signals reclaim on its own opportunistic leases (`acquire`). Hard-fails on a CUDA host without pynvml — silent fallback would defeat the cross-check. Cache window 1s. Non-GPU acquires never touch pynvml (the `cuda` extra is optional). Uses `State.reclaimable_for_shortfall(..., partial=True)` so we evict what we can even when an external (unaccounted) consumer will keep us short anyway — the lease is granted on a later poll once the external process exits, or the caller's outer timeout kicks in.
 - `LeaseHandle.shrink()` doesn't need its own scheduler hook — waiters in `_acquire_blocking` / `acquire_async` already poll `_try_promote()` every `poll_interval`, so freed capacity is picked up naturally (same as `release()`).
 - `Lease.queued_at` / `Lease.wait_sec` (added in v0.6.0) are stamped at promotion time so consumers can split "queued behind reslock" from "running on GPU" without timing the acquire themselves. `try_acquire` records `wait_sec=0.0` (no queue path); `_try_promote` computes `acquired_at - queued_at`. `LeaseHandle.gpu_uuids` and `LeaseHandle.gpu_torch_indices` derive GPU device lists from the lease's `gpu_{uuid}_vram_mb` keys (the latter is empty when CUDA/torch isn't available). Schema version stays at 2 because the new fields are additive `Optional[...] = None`, but `Lease.model_config = {"extra": "forbid"}` means a 0.5.x reader will reject a state file written by 0.6.0 — upgrade all consumers on a host together.
 

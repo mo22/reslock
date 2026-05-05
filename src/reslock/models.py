@@ -86,6 +86,33 @@ class State(BaseModel):
             deficit = val - avail.get(key, 0)
             if deficit > 0:
                 shortfall[key] = deficit
+        return self.reclaimable_for_shortfall(shortfall)
+
+    def reclaimable_for_shortfall(
+        self, shortfall: dict[str, int], *, partial: bool = False
+    ) -> list[Lease]:
+        """Pick reclaimable leases that cover a precomputed shortfall.
+
+        Walks reclaimable, not-yet-reclaim-requested leases in ascending
+        priority order, accumulating those that contribute to any shortfall
+        key.
+
+        When ``partial=False`` (the default), returns the selected leases only
+        if they together fully cover the shortfall — otherwise returns an
+        empty list, meaning "no point evicting, the request can't be
+        satisfied even by reclaiming everything reclaimable". This matches
+        the strict accounting case (``reclaimable_for``) where partial
+        eviction would be pointless churn since ``state.can_fit`` is
+        deterministic from internal accounting alone.
+
+        When ``partial=True``, returns every reclaimable that contributes,
+        even if the union doesn't cover the shortfall. This is what the NVML
+        pre-flight wants: the gap may be partly an unaccounted external
+        process that reslock can never reclaim, but freeing what we *can*
+        free is still useful — the lease may grant on a later poll once the
+        external process exits, or its outer caller (e.g. scriba's 600s
+        budget) decides to give up.
+        """
         if not shortfall:
             return []
         candidates = [ls for ls in self.leases if ls.reclaimable and not ls.reclaim_requested]
@@ -105,7 +132,7 @@ class State(BaseModel):
                         del remaining[key]
             if helps:
                 result.append(lease)
-        if remaining:
+        if remaining and not partial:
             return []
         return result
 

@@ -1,10 +1,9 @@
-"""Pool-level tests for the pynvml pre-flight integration.
+"""Pool-level tests for the pynvml pre-flight integration under v3 abstract shape.
 
-These exercise the SCRIBA-325 scenario end-to-end: an external (unaccounted)
-process holding VRAM, internal lease accounting saying the GPU has free
-headroom, NVML correctly reporting the gap, and reslock either refusing the
-lease (``try_acquire``) or signalling reclaim on opportunistic leases that
-together cover the shortfall (blocking ``acquire``).
+Same SCRIBA-325 scenario end-to-end — external (unaccounted) process holds
+VRAM, internal accounting says the GPU is free, NVML reports the gap — but
+exercised through the v3 ``vram_mb_each`` + ``num_gpus`` request shape
+(scheduler picks the UUID; NVML cross-check happens on the picked UUID).
 """
 
 from __future__ import annotations
@@ -101,7 +100,7 @@ def test_try_acquire_grants_when_nvml_has_headroom(
     pool = ResourcePool(tmp_path / "state.json")
     pool.set_resources({gpu_vram_key(UUID_A): 24000})
 
-    h = pool.try_acquire(**{gpu_vram_key(UUID_A): 14000})  # pyright: ignore[reportArgumentType]
+    h = pool.try_acquire(vram_mb_each=14000, num_gpus=1)
     assert h is not None
     h.release()
 
@@ -109,14 +108,14 @@ def test_try_acquire_grants_when_nvml_has_headroom(
 def test_try_acquire_refuses_when_nvml_short_despite_internal_fit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Internal accounting: 24 GB total, no leases → 24 GB free.
-    # NVML: only 4 GB free (some external process holds 20 GB).
-    # Request: 14 GB. Internal says fit, NVML says short → refuse.
+    """Internal accounting: 24 GB total, no leases → 24 GB free.
+    NVML: only 4 GB free (some external process holds 20 GB).
+    Request: 14 GB on 1 GPU. Internal-fit yes, NVML-short → refuse."""
     monkeypatch.setitem(sys.modules, "pynvml", _fake_pynvml([(UUID_A, 24000, 4000)]))
     pool = ResourcePool(tmp_path / "state.json")
     pool.set_resources({gpu_vram_key(UUID_A): 24000})
 
-    h = pool.try_acquire(**{gpu_vram_key(UUID_A): 14000})  # pyright: ignore[reportArgumentType]
+    h = pool.try_acquire(vram_mb_each=14000, num_gpus=1)
     assert h is None
 
 
@@ -137,7 +136,7 @@ def test_try_acquire_raises_when_pynvml_missing_for_gpu_request(
     pool.set_resources({gpu_vram_key(UUID_A): 24000})
 
     with pytest.raises(nvml.NvmlUnavailableError):
-        pool.try_acquire(**{gpu_vram_key(UUID_A): 1000})  # pyright: ignore[reportArgumentType]
+        pool.try_acquire(vram_mb_each=1000, num_gpus=1)
 
 
 # --- blocking acquire: reclaim signalling on NVML drift ---
@@ -193,11 +192,12 @@ def test_blocking_acquire_requests_reclaim_when_nvml_short(
     monkeypatch.setitem(sys.modules, "pynvml", _make_dynamic_pynvml(free_box))
 
     pool = ResourcePool(tmp_path / "state.json")
-    key = gpu_vram_key(UUID_A)
-    pool.set_resources({key: 24000})
+    pool.set_resources({gpu_vram_key(UUID_A): 24000})
 
     # Phase 1: holder grabs a 5 GB reclaimable lease while NVML has headroom.
-    holder = pool.try_acquire(reclaimable=True, label="opportunistic", **{key: 5000})  # pyright: ignore[reportArgumentType]
+    holder = pool.try_acquire(
+        vram_mb_each=5000, num_gpus=1, reclaimable=True, label="opportunistic"
+    )
     assert holder is not None
 
     # Phase 2: an external process consumes 15 GB (invisible to reslock).
@@ -205,11 +205,14 @@ def test_blocking_acquire_requests_reclaim_when_nvml_short(
     free_box["free"] = 4000
     nvml.reset_for_test()  # bust 1s cache so the next read sees the new value
 
-    # Waiter tries to acquire 14 GB. Internal says fit (19 free); NVML says
-    # short (only 4 free). Reslock should mark the 5 GB reclaimable holder.
+    # Waiter tries to acquire 14 GB on 1 GPU. Internal scheduler picks UUID_A
+    # (19 free); NVML cross-check fails (only 4 free). Reslock should mark
+    # the 5 GB reclaimable holder.
     def _waiter() -> None:
         try:
-            with pool.acquire(label="needs-vram", poll_interval=0.05, **{key: 14000}):  # pyright: ignore[reportArgumentType]
+            with pool.acquire(
+                vram_mb_each=14000, num_gpus=1, label="needs-vram", poll_interval=0.05
+            ):
                 pass
         except BaseException:
             return
@@ -241,10 +244,11 @@ def test_blocking_acquire_grants_after_holder_releases(
     monkeypatch.setitem(sys.modules, "pynvml", _make_dynamic_pynvml(free_box))
 
     pool = ResourcePool(tmp_path / "state.json")
-    key = gpu_vram_key(UUID_A)
-    pool.set_resources({key: 24000})
+    pool.set_resources({gpu_vram_key(UUID_A): 24000})
 
-    holder = pool.try_acquire(reclaimable=True, label="opportunistic", **{key: 5000})  # pyright: ignore[reportArgumentType]
+    holder = pool.try_acquire(
+        vram_mb_each=5000, num_gpus=1, reclaimable=True, label="opportunistic"
+    )
     assert holder is not None
 
     # External process arrives. NVML drops; internal still thinks fit.
@@ -254,7 +258,9 @@ def test_blocking_acquire_grants_after_holder_releases(
     granted: dict[str, Any] = {}
 
     def _waiter() -> None:
-        with pool.acquire(label="needs-vram", poll_interval=0.05, **{key: 14000}) as h:  # pyright: ignore[reportArgumentType]
+        with pool.acquire(
+            vram_mb_each=14000, num_gpus=1, label="needs-vram", poll_interval=0.05
+        ) as h:
             granted["id"] = h.id
 
     t = threading.Thread(target=_waiter, daemon=True)
@@ -283,26 +289,23 @@ def test_blocking_acquire_grants_after_holder_releases(
 def test_priority_gate_does_not_block_on_nvml_short_higher_priority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Codex review repro: a high-priority GPU waiter that internally fits but
-    is NVML-short must NOT block a lower-priority non-GPU waiter from being
-    promoted. The old gate checked ``state.can_fit()`` only and would let the
-    GPU entry block the RAM waiter forever.
-    """
+    """Codex review repro, ported to v3: a high-priority GPU waiter that
+    internally fits but is NVML-short must NOT block a lower-priority non-GPU
+    waiter from being promoted."""
     # NVML reports only 1 GB free on the GPU — internal accounting still
     # thinks the full 24 GB is available because no GPU lease is held.
     free_box = {"free": 1000}
     monkeypatch.setitem(sys.modules, "pynvml", _make_dynamic_pynvml(free_box))
 
     pool = ResourcePool(tmp_path / "state.json")
-    gpu_key = gpu_vram_key(UUID_A)
-    pool.set_resources({gpu_key: 24000, "ram_mb": 8000})
+    pool.set_resources({gpu_vram_key(UUID_A): 24000, "ram_mb": 8000})
 
     ram_granted: dict[str, Any] = {}
 
     def _gpu_waiter() -> None:
         # High priority. Internal-fit yes, NVML-short yes → stays queued.
         try:
-            with pool.acquire(priority=10, poll_interval=0.05, **{gpu_key: 14000}):  # pyright: ignore[reportArgumentType]
+            with pool.acquire(priority=10, vram_mb_each=14000, num_gpus=1, poll_interval=0.05):
                 pass
         except BaseException:
             return
@@ -314,7 +317,6 @@ def test_priority_gate_does_not_block_on_nvml_short_higher_priority(
     gpu_thread = threading.Thread(target=_gpu_waiter, daemon=True)
     gpu_thread.start()
 
-    # Give the GPU waiter a moment to enqueue so the RAM waiter sees it ahead.
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
         if any(e.priority == 10 for e in pool.status().queue):
@@ -336,3 +338,54 @@ def test_priority_gate_does_not_block_on_nvml_short_higher_priority(
     free_box["free"] = 24000
     nvml.reset_for_test()
     gpu_thread.join(timeout=2.0)
+
+
+def test_irrecoverable_nvml_drift_does_not_evict_unrelated_reclaimables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review P2 regression: an irrecoverable NVML drift on the GPU
+    must not request reclaim on RAM-only reclaimable leases (or on leases
+    holding GPUs that aren't part of the shortfall). Pre-fix, the eviction
+    simulation would loop through every reclaimable candidate and mark them
+    all when no covering set exists.
+    """
+    free_box = {"free": 1000}  # external process holds essentially everything
+    monkeypatch.setitem(sys.modules, "pynvml", _make_dynamic_pynvml(free_box))
+
+    pool = ResourcePool(tmp_path / "state.json")
+    pool.set_resources({gpu_vram_key(UUID_A): 24000, "ram_mb": 16000})
+
+    # An unrelated RAM-only reclaimable lease — eviction can't help a GPU
+    # shortfall, so it must be left alone.
+    ram_holder = pool.try_acquire(reclaimable=True, label="ram-cache", ram_mb=8000)
+    assert ram_holder is not None
+
+    def _waiter() -> None:
+        try:
+            with pool.acquire(
+                vram_mb_each=14000, num_gpus=1, label="needs-vram", poll_interval=0.05
+            ):
+                pass
+        except BaseException:
+            return
+
+    t = threading.Thread(target=_waiter, daemon=True)
+    t.start()
+
+    # Give the waiter several poll ticks to exercise the reclaim path.
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    # The RAM-only lease must not have been flipped to reclaim_requested.
+    state = pool.status()
+    ram_state = next(ls for ls in state.leases if ls.id == ram_holder.id)
+    assert ram_state.reclaim_requested is False, (
+        "RAM-only reclaimable must not be evicted to satisfy a GPU shortfall"
+    )
+
+    ram_holder.release()
+    # Drain the waiter cleanly.
+    free_box["free"] = 24000
+    nvml.reset_for_test()
+    t.join(timeout=2.0)

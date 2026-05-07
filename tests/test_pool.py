@@ -220,10 +220,12 @@ def test_acquire_wait_sec_reflects_queue_time(tmp_path: Path) -> None:
 
     def _waiter() -> None:
         h = pool._acquire_blocking(  # pyright: ignore[reportPrivateUsage]
-            resources={"vram_mb": 4000},
+            vram_mb_each=None,
+            num_gpus=0,
+            non_gpu={"vram_mb": 4000},
             priority=0,
-            estimated_seconds=None,
             reclaimable=False,
+            estimated_seconds=None,
             label=None,
             poll_interval=poll_interval,
         )

@@ -21,10 +21,9 @@ from reslock.detect import (
     get_all_pid_vram_per_gpu_mb,
     get_pid_cpu_seconds,
     get_pid_rss_mb,
-    gpu_resource_key,
     parse_gpu_vram_key,
 )
-from reslock.models import State
+from reslock.models import QueueEntry, State
 from reslock.pool import ResourcePool
 from reslock.state import DEFAULT_STATE_PATH, ensure_state_file, transact
 
@@ -168,21 +167,55 @@ def status(state: Path | None, short: bool) -> None:
         console.print(table)
 
     if st.queue:
-        table = Table(title=f"Queue ({len(st.queue)} waiting)")
-        table.add_column("ID", style="cyan")
-        table.add_column("PID")
-        table.add_column("Resources")
-        table.add_column("Priority", justify="right")
-        table.add_column("Label")
-        table.add_column("Queued")
+        active = [e for e in st.queue if e.is_active]
+        waiting = [e for e in st.queue if not e.is_active]
         now = datetime.now(timezone.utc)
-        for e in st.queue:
-            age = now - e.queued_at
-            secs = int(age.total_seconds())
-            queued_str = f"{secs // 60}m ago" if secs >= 60 else f"{secs}s ago"
-            res_str = _fmt_resources(e.resources)
-            table.add_row(e.id, str(e.pid), res_str, str(e.priority), e.label or "", queued_str)
-        console.print(table)
+
+        def _fmt_request(e: QueueEntry) -> str:
+            parts: list[str] = []
+            if e.num_gpus > 0 and e.vram_mb_each is not None:
+                parts.append(f"{e.num_gpus}x{e.vram_mb_each}MB GPU")
+            if e.resources:
+                parts.append(_fmt_resources(e.resources))
+            return ", ".join(parts) or "-"
+
+        if waiting:
+            table = Table(title=f"Queue ({len(waiting)} waiting)")
+            table.add_column("ID", style="cyan")
+            table.add_column("PID")
+            table.add_column("Request")
+            table.add_column("Priority", justify="right")
+            table.add_column("Label")
+            table.add_column("Queued")
+            for e in waiting:
+                age = now - e.queued_at
+                secs = int(age.total_seconds())
+                queued_str = f"{secs // 60}m ago" if secs >= 60 else f"{secs}s ago"
+                table.add_row(
+                    e.id, str(e.pid), _fmt_request(e), str(e.priority), e.label or "", queued_str
+                )
+            console.print(table)
+
+        if active:
+            table = Table(title=f"Active work ({len(active)} entries)")
+            table.add_column("ID", style="cyan")
+            table.add_column("PID")
+            table.add_column("Lease")
+            table.add_column("ETA")
+            table.add_column("Progress", justify="right")
+            table.add_column("Label")
+            for e in active:
+                eta = f"{e.estimated_seconds}s" if e.estimated_seconds is not None else "-"
+                progress = f"{e.progress:.0%}" if e.progress is not None else "-"
+                table.add_row(
+                    e.id,
+                    str(e.pid),
+                    e.lease_id or "-",
+                    eta,
+                    progress,
+                    e.label or "",
+                )
+            console.print(table)
 
     if not st.leases and not st.queue:
         console.print("[dim]No active leases or queued requests.[/dim]")
@@ -224,10 +257,19 @@ def release(lease_id: str | None, label: str | None, state: Path | None) -> None
 
     def _release(st: State) -> None:
         before = len(st.leases)
+        removed: set[str] = set()
         if lease_id:
+            removed = {ls.id for ls in st.leases if ls.id == lease_id}
             st.leases = [ls for ls in st.leases if ls.id != lease_id]
         elif label:
+            removed = {ls.id for ls in st.leases if ls.label == label}
             st.leases = [ls for ls in st.leases if ls.label != label]
+        # Drop any active QueueEntries attached to the released leases — v3
+        # entries persist across active state, so a CLI release that doesn't
+        # also clean them up would leave orphans pointing at a missing lease,
+        # which keeps peer ETA calculations reading stale work.
+        if removed:
+            st.queue = [e for e in st.queue if e.lease_id not in removed]
         released.extend(["x"] * (before - len(st.leases)))
 
     transact(path, _release)
@@ -280,6 +322,11 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
         # Gather live measurements — sum across main PID + registered child PIDs
         pid_vram = get_all_pid_vram_mb()
         pid_vram_per_gpu = get_all_pid_vram_per_gpu_mb()
+        # Map lease_id → most recent attached entry, for ETA/progress display.
+        attached_entry: dict[str, QueueEntry] = {}
+        for e in st.queue:
+            if e.lease_id is not None:
+                attached_entry[e.lease_id] = e
         lease_rss: dict[str, int] = {}
         lease_cpu: dict[str, float] = {}
         lease_vram: dict[str, int] = {}
@@ -399,7 +446,12 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
                 else:
                     cpu_str = "-"
 
-                progress_str = f"{lease.progress:.0%}" if lease.progress is not None else "-"
+                attached = attached_entry.get(lease.id)
+                progress_str = (
+                    f"{attached.progress:.0%}"
+                    if attached is not None and attached.progress is not None
+                    else "-"
+                )
 
                 flags: list[str] = []
                 if lease.reclaimable:
@@ -421,11 +473,17 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
 
             console.print(lease_table, end="")
 
-        if st.queue:
+        waiting = [e for e in st.queue if not e.is_active]
+        if waiting:
             grid.add_section()
-            for e in st.queue:
-                res_str = ", ".join(f"{k}={v}" for k, v in e.resources.items())
-                grid.add_row(f"Queued [{e.id}]", f"pid={e.pid}  {res_str}  prio={e.priority}")
+            for e in waiting:
+                parts: list[str] = []
+                if e.num_gpus > 0 and e.vram_mb_each is not None:
+                    parts.append(f"{e.num_gpus}x{e.vram_mb_each}MB GPU")
+                if e.resources:
+                    parts.append(", ".join(f"{k}={v}" for k, v in e.resources.items()))
+                req = ", ".join(parts) or "-"
+                grid.add_row(f"Queued [{e.id}]", f"pid={e.pid}  {req}  prio={e.priority}")
 
         return grid
 
@@ -442,11 +500,13 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
 
 
 @main.command()
-@click.option("--vram", default=None, help="VRAM to reserve on GPU 0 (e.g., 4G, 500M)")
 @click.option(
-    "--gpu-vram",
-    multiple=True,
-    help="Per-GPU VRAM: INDEX:SIZE (e.g., --gpu-vram 0:4G --gpu-vram 1:8G)",
+    "--vram-mb-each",
+    default=None,
+    help="Per-GPU VRAM to reserve (e.g., 4G, 500M). Required when --num-gpus > 0.",
+)
+@click.option(
+    "--num-gpus", type=int, default=0, help="Number of GPUs to reserve (scheduler picks any)"
 )
 @click.option("--ram", default=None, help="RAM to reserve (e.g., 16G)")
 @click.option("--cpu", type=int, default=None, help="CPU cores to reserve")
@@ -456,6 +516,12 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
     "--reclaimable", is_flag=True, help="Allow lease to be reclaimed by higher-priority requests"
 )
 @click.option(
+    "--estimated-seconds",
+    type=int,
+    default=None,
+    help="Predicted wall-clock seconds for the work; auto-creates a tracking entry",
+)
+@click.option(
     "--reclaim-signal",
     default="SIGTERM",
     help="Signal to send to the child process when reclaim is requested (default: SIGTERM)",
@@ -463,51 +529,43 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
 @click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
 @click.argument("command", nargs=-1, required=True)
 def run(
-    vram: str | None,
-    gpu_vram: tuple[str, ...],
+    vram_mb_each: str | None,
+    num_gpus: int,
     ram: str | None,
     cpu: int | None,
     priority: int,
     label: str | None,
     reclaimable: bool,
+    estimated_seconds: int | None,
     reclaim_signal: str,
     state: Path | None,
     command: tuple[str, ...],
 ) -> None:
     """Reserve resources and run a command.
 
-    With --reclaimable, the lease can be reclaimed by higher-priority requests.
-    When reclaim is requested, the specified signal is sent to the child process.
+    GPU placement: if --num-gpus > 0, the scheduler picks --num-gpus GPUs
+    with the most free VRAM at promotion time (spread placement). Use
+    --reclaimable to allow eviction by higher-priority requests; on reclaim
+    the specified signal is sent to the child process.
     """
+    vram_each_mb: int | None = None
+    if vram_mb_each is not None:
+        vram_each_mb = _parse_size(vram_mb_each)
+    if num_gpus > 0 and vram_each_mb is None:
+        raise click.UsageError("--vram-mb-each is required when --num-gpus > 0")
+    if vram_each_mb is not None and num_gpus == 0:
+        raise click.UsageError("--num-gpus must be > 0 when --vram-mb-each is set")
 
-    def _gpu_key_for_index(index: int) -> str:
-        key = gpu_resource_key(index)
-        if key is None:
-            raise click.BadParameter(
-                f"Could not resolve GPU UUID for torch index {index}. "
-                "Install torch (>=2.0) or ensure nvidia-smi is on PATH."
-            )
-        return key
-
-    resources: dict[str, int] = {}
-    if vram:
-        resources[_gpu_key_for_index(0)] = _parse_size(vram)
-    for spec in gpu_vram:
-        if ":" not in spec:
-            raise click.BadParameter(f"Expected INDEX:SIZE, got: {spec}")
-        idx_str, size_str = spec.split(":", 1)
-        try:
-            idx = int(idx_str)
-        except ValueError as exc:
-            raise click.BadParameter(f"GPU index must be an integer: {idx_str}") from exc
-        resources[_gpu_key_for_index(idx)] = _parse_size(size_str)
+    non_gpu: dict[str, int] = {}
     if ram:
-        resources["ram_mb"] = _parse_size(ram)
+        non_gpu["ram_mb"] = _parse_size(ram)
     if cpu:
-        resources["cpu_cores"] = cpu
+        non_gpu["cpu_cores"] = cpu
 
-    if not resources:
-        raise click.UsageError("Specify at least one resource (--vram, --ram, --cpu)")
+    if num_gpus == 0 and not non_gpu:
+        raise click.UsageError(
+            "Specify at least one resource (--vram-mb-each + --num-gpus, --ram, --cpu)"
+        )
 
     sig = getattr(signal, reclaim_signal, None)
     if sig is None:
@@ -517,12 +575,32 @@ def run(
     ensure_state_file(path)
     pool = ResourcePool(path)
 
-    console.print(f"[dim]Waiting for resources: {resources}...[/dim]")
+    parts: list[str] = []
+    if num_gpus > 0:
+        parts.append(f"{num_gpus}x{vram_each_mb}MB GPU")
+    if non_gpu:
+        parts.extend(f"{k}={v}" for k, v in non_gpu.items())
+    console.print(f"[dim]Waiting for resources: {', '.join(parts)}...[/dim]")
     with pool.acquire(
-        priority=priority, label=label, reclaimable=reclaimable, **resources
+        vram_mb_each=vram_each_mb,
+        num_gpus=num_gpus,
+        priority=priority,
+        label=label,
+        reclaimable=reclaimable,
+        estimated_seconds=estimated_seconds,
+        **non_gpu,
     ) as lease:
         console.print(f"[green]Acquired lease {lease.id}[/green]")
-        proc = subprocess.Popen(list(command))
+        # Pin the child to the granted GPUs. CUDA accepts UUID-form
+        # CUDA_VISIBLE_DEVICES, so we don't need to resolve to torch indices.
+        # Without this, a child that defaults to GPU 0 could allocate on an
+        # unreserved card and trample another lease.
+        env: dict[str, str] | None = None
+        if lease.gpu_uuids:
+            import os as _os
+
+            env = {**_os.environ, "CUDA_VISIBLE_DEVICES": ",".join(lease.gpu_uuids)}
+        proc = subprocess.Popen(list(command), env=env)
         lease.update(pids=[proc.pid])
 
         def _sighandler(signum: int, _frame: object) -> None:

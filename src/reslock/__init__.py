@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from reslock.audit import OrphanReport, gpu_orphans
 from reslock.detect import (
     gpu_resource_key,
     gpu_uuid_for_torch_index,
@@ -9,7 +10,7 @@ from reslock.detect import (
     parse_gpu_vram_key,
 )
 from reslock.models import SCHEMA_VERSION, Lease, PoolStatus, QueueEntry, State
-from reslock.pool import LeaseHandle, ResourcePool
+from reslock.pool import EntryHandle, LeaseHandle, ResourcePool
 from reslock.resources import (
     detect_cpu_cores,
     detect_disk_mb,
@@ -21,8 +22,10 @@ from reslock.resources import (
 
 __all__ = [
     "SCHEMA_VERSION",
+    "EntryHandle",
     "Lease",
     "LeaseHandle",
+    "OrphanReport",
     "PoolStatus",
     "QueueEntry",
     "ResourcePool",
@@ -33,6 +36,7 @@ __all__ = [
     "detect_gpu_vram_mb_nvidia_smi",
     "detect_gpu_vram_mb_torch",
     "detect_network_bandwidth",
+    "gpu_orphans",
     "gpu_resource_key",
     "gpu_uuid_for_torch_index",
     "gpu_vram_key",

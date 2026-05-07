@@ -36,3 +36,44 @@ def test_reset(tmp_path: Path) -> None:
     assert result.exit_code == 0
     state = State.model_validate_json(path.read_text())
     assert len(state.leases) == 0
+
+
+def test_release_drops_attached_entries(tmp_path: Path) -> None:
+    """Regression for codex follow-up P2: CLI release must drop active
+    QueueEntries attached to the released lease(s), or peers see stale work
+    pointing at a missing lease.
+    """
+    from reslock import ResourcePool
+
+    path = tmp_path / "state.json"
+    pool = ResourcePool(path)
+    pool.set_resources({"ram_mb": 4000})
+    lease = pool.try_acquire(ram_mb=1000, estimated_seconds=30, label="trackme")
+    assert lease is not None
+    assert pool.status().queue, "auto-tracked entry should exist before release"
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["release", lease.id, "--state", str(path)])
+    assert result.exit_code == 0
+
+    state = State.model_validate_json(path.read_text())
+    assert state.leases == []
+    assert state.queue == [], "attached entry must be dropped together with the lease"
+
+
+def test_release_by_label_drops_attached_entries(tmp_path: Path) -> None:
+    from reslock import ResourcePool
+
+    path = tmp_path / "state.json"
+    pool = ResourcePool(path)
+    pool.set_resources({"ram_mb": 4000})
+    lease = pool.try_acquire(ram_mb=1000, estimated_seconds=30, label="trackme")
+    assert lease is not None
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["release", "--label", "trackme", "--state", str(path)])
+    assert result.exit_code == 0
+
+    state = State.model_validate_json(path.read_text())
+    assert state.leases == []
+    assert state.queue == []

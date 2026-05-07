@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import portalocker
 
@@ -20,22 +21,43 @@ logger = logging.getLogger(__name__)
 def _load_state(data: str) -> State:
     """Parse state JSON and migrate across schema versions.
 
-    Schema version 2 changed GPU VRAM keys from index-based (``gpu0_vram_mb``)
-    to UUID-based (``gpu_GPU-<uuid>_vram_mb``). Older snapshots are dropped —
-    ``resources``, ``leases``, and ``queue`` are reset — so the next
-    ``set_resources()`` / ``acquire()`` calls repopulate with UUID keys.
+    Any non-current ``version`` triggers a reset: ``resources``, ``leases``,
+    and ``queue`` are dropped so the next ``set_resources()`` / ``acquire()``
+    repopulates under the current schema. This is how the v0.5.0 (v1→v2) and
+    v0.8.0 (v2→v3) schema bumps were rolled out — coordinated upgrade across
+    consumers, state file resets on first read by a new-version process.
     Dead PID cleanup handles stale process entries separately.
+
+    The version is peeked from the raw JSON before strict Pydantic validation,
+    because a v0.7.x state file carries ``Lease.estimated_seconds`` /
+    ``Lease.progress`` fields that v3's ``extra="forbid"`` Lease would reject
+    — without the peek, an upgrade-time read would crash before reaching the
+    reset path.
     """
-    state = State.model_validate_json(data)
-    if state.version != SCHEMA_VERSION:
+    try:
+        parsed: Any = json.loads(data)
+    except json.JSONDecodeError:
+        # Corrupt or empty JSON — fall through to model_validate which raises
+        # with detail. This is intentionally fail-closed: a truncated state
+        # file (e.g. a crash mid-``transact()`` rewrite) must NOT be silently
+        # treated as "fresh empty state", which would let new acquires proceed
+        # while in-flight leases were lost.
+        return State.model_validate_json(data)
+
+    if not isinstance(parsed, dict):
+        # Top-level JSON wasn't an object — let pydantic raise the
+        # canonical validation error.
+        return State.model_validate_json(data)
+    found_version: Any = parsed.get("version")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    if found_version != SCHEMA_VERSION:
         logger.warning(
-            "reslock state schema v%d detected (expected v%d) — resetting "
+            "reslock state schema %r detected (expected v%d) — resetting "
             "resources, leases, and queue. Consumers must re-register resources.",
-            state.version,
+            f"v{found_version}",
             SCHEMA_VERSION,
         )
         return State()
-    return state
+    return State.model_validate_json(data)
 
 
 def _default_state_path() -> Path:

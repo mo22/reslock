@@ -5,14 +5,15 @@ Resource lock manager for coordinating shared system resources (GPU VRAM, RAM, C
 ## Project Structure
 
 - `src/reslock/` — library source
-  - `pool.py` — `ResourcePool` and `LeaseHandle` (main API)
-  - `models.py` — Pydantic models (`State`, `Lease`, `QueueEntry`, `PoolStatus`)
+  - `pool.py` — `ResourcePool`, `LeaseHandle`, `EntryHandle` (main API)
+  - `models.py` — Pydantic models (`State`, `Lease`, `QueueEntry`, `PoolStatus`) plus the v3 scheduler (`State.try_resolve_request`)
   - `state.py` — file-locked state read/write
   - `detect.py` — system resource detection (GPU VRAM via nvidia-smi/torch, CPU, disk)
   - `nvml.py` — pynvml pre-flight (driver-side free VRAM ground truth, hard-fails on CUDA hosts without pynvml)
+  - `audit.py` — GPU orphan diagnosis (PIDs holding VRAM not covered by any lease)
   - `resources.py` — public detection API (re-exports from detect.py)
   - `cleanup.py` — dead-PID lease cleanup
-  - `cli.py` — Click CLI (`reslock status`, `reslock acquire`, etc.)
+  - `cli.py` — Click CLI (`reslock status`, `reslock run`, etc.)
 - `tests/` — pytest tests
 - `examples/` — usage examples
 
@@ -41,13 +42,23 @@ Do NOT publish manually with `uv publish` — the project uses PyPI trusted publ
 - File locks are held only during reads/writes, not for lease duration
 - `read_state()` uses shared lock (`portalocker "r"`), `transact()` uses exclusive lock (`"r+"`) — read-heavy workloads don't block each other
 - Dead processes cleaned up automatically via PID checking; a lease is alive if owner PID OR any child PID in `lease.pids` is alive
-- Per-GPU VRAM tracking for multi-GPU systems. Keys are UUID-based: `gpu_{UUID}_vram_mb` (e.g. `gpu_GPU-1a2b3c4d-..._vram_mb`). Keying by the host-stable GPU UUID (not nvidia-smi index) keeps coordination correct across containers with partial GPU mappings — the NVIDIA container runtime renumbers visible devices from 0, but UUIDs are invariant. Consumers that hold a local torch index should use `reslock.gpu_resource_key(i)` to build the key.
-- State-file schema version: `2` (bumped from `1` in v0.5.0 when GPU keys switched to UUIDs). On read, files with a different `version` are reset — `resources`, `leases`, `queue` are all cleared so consumers repopulate with UUID keys. Upgrade procedure: stop all reslock consumers on a host, delete `state.json`, redeploy with matching versions.
-- Priority queue determines which waiter gets resources next
-- Reclaimable leases allow preemption by higher-priority work
-- NVML pre-flight (v0.7.0+, `nvml.py`): on every GPU VRAM acquire, reslock reads driver-reported free VRAM via pynvml and compares against the request. If the driver disagrees with internal lease accounting (typically because a process holds VRAM without a registered lease — see SCRIBA-325), reslock either refuses (`try_acquire`) or signals reclaim on its own opportunistic leases (`acquire`). Hard-fails on a CUDA host without pynvml — silent fallback would defeat the cross-check. Cache window 1s. Non-GPU acquires never touch pynvml (the `cuda` extra is optional). Uses `State.reclaimable_for_shortfall(..., partial=True)` so we evict what we can even when an external (unaccounted) consumer will keep us short anyway — the lease is granted on a later poll once the external process exits, or the caller's outer timeout kicks in.
+- Per-GPU VRAM tracking for multi-GPU systems. **Capacity registration** still uses UUID-based keys: `gpu_{UUID}_vram_mb` (e.g. `gpu_GPU-1a2b3c4d-..._vram_mb`). Keying by the host-stable GPU UUID (not nvidia-smi index) keeps coordination correct across containers with partial GPU mappings — the NVIDIA container runtime renumbers visible devices from 0, but UUIDs are invariant. **Acquire requests** in v3 are abstract (`vram_mb_each` + `num_gpus`); the scheduler binds specific UUIDs at promotion time. The lease's `resources` dict stores those resolved UUID-keyed bindings. Consumers that hold a local torch index can still use `reslock.gpu_resource_key(i)` for capacity registration.
+- State-file schema version: `3`. Bumps:
+  - v1 → v2 (v0.5.0): GPU keys switched from index-based to UUID-based.
+  - v2 → v3 (v0.8.0): split `Lease` (resource reservation) from `QueueEntry` (work item — queued or active). Work-tracking fields (`estimated_seconds`, `progress`) moved to `QueueEntry`. Acquire request shape changed to `vram_mb_each` + `num_gpus`. Reclaim now skips leases with any active QueueEntry attached.
+  - On read, files with a different `version` reset `resources`, `leases`, and `queue` so consumers repopulate. Upgrade procedure: stop all reslock consumers on a host, delete `state.json`, redeploy with matching versions.
+- v3 scheduler: spread placement. GPUs sorted by free VRAM descending (ties broken by UUID), pick the top `num_gpus` whose free ≥ `vram_mb_each`. Matches multi-GPU inference workloads (NCCL / tensor parallel) where you want disjoint cards with similar headroom.
+- Priority queue determines which waiter gets resources next. The priority gate also requires the higher-priority entry would actually fit on the next tick (internal accounting + NVML cross-check on the GPUs the scheduler would pick) — otherwise an NVML-short waiter would silently block lower-priority non-GPU waiters.
+- Reclaimable leases allow preemption by higher-priority work. Reclaim **skips** leases that have any active `QueueEntry` attached — consumers cooperatively mark leases busy via `lease.start_work(...)` for the duration of in-flight requests, and the scheduler won't try to evict them. The busy state is implied by entry attachment (no separate `Lease.busy` field).
+- Work tracking model: a `QueueEntry` represents a unit of work, queued or actively running. On promotion the entry stays in `state.queue` with `lease_id` and `started_at` set (`is_active == True`). Two ways to create an attached entry:
+  - **Auto-track**: `pool.acquire(estimated_seconds=N)` keeps the queueing entry attached to the new lease. `LeaseHandle.entry` exposes the `EntryHandle`. Auto-completed on `lease.release()`.
+  - **Per-request**: `lease.start_work(estimated_seconds=M)` creates a new attached entry for one inference call on a persistent reclaimable lease (e.g. aiserver's model-load lease). Caller-managed: explicit `entry.complete()` or `with` block.
+  - Peers walking `pool.status().queue` see all active work with optional `estimated_seconds` / `progress`. `Lease.acquired_at` is meaningless for ETA on long-lived leases — peers should compute `entry.estimated_seconds * (1 - entry.progress)` or `(now - entry.started_at)` deltas instead.
+- NVML pre-flight (`nvml.py`): on every GPU acquire, reslock reads driver-reported free VRAM via pynvml and cross-checks the scheduler's picked GPUs. If the driver disagrees with internal lease accounting (typically because a process holds VRAM without a registered lease — see SCRIBA-325), reslock either refuses (`try_acquire`) or signals reclaim on its own opportunistic leases (`acquire`). Hard-fails on a CUDA host without pynvml — silent fallback would defeat the cross-check. Cache window 1s. Non-GPU acquires never touch pynvml (the `cuda` extra is optional). Reclaim cascades to exhaustion when NVML drift is involved (`partial=True`): we evict every reclaimable that contributes, even if the union won't fully cover the gap, since the residual may be an external (unaccounted) consumer that's about to leave.
+- `reslock.audit.gpu_orphans(state)` (v0.8.0+): diagnostic primitive that returns PIDs holding VRAM (per `nvidia-smi --query-compute-apps`) that aren't registered with any active lease. Reslock itself never terminates orphans — that policy belongs in the consumer (e.g. aiserver's `gpu_audit.py`). Exposed as `pool.gpu_orphans()` for convenience.
 - `LeaseHandle.shrink()` doesn't need its own scheduler hook — waiters in `_acquire_blocking` / `acquire_async` already poll `_try_promote()` every `poll_interval`, so freed capacity is picked up naturally (same as `release()`).
-- `Lease.queued_at` / `Lease.wait_sec` (added in v0.6.0) are stamped at promotion time so consumers can split "queued behind reslock" from "running on GPU" without timing the acquire themselves. `try_acquire` records `wait_sec=0.0` (no queue path); `_try_promote` computes `acquired_at - queued_at`. `LeaseHandle.gpu_uuids` and `LeaseHandle.gpu_torch_indices` derive GPU device lists from the lease's `gpu_{uuid}_vram_mb` keys (the latter is empty when CUDA/torch isn't available). Schema version stays at 2 because the new fields are additive `Optional[...] = None`, but `Lease.model_config = {"extra": "forbid"}` means a 0.5.x reader will reject a state file written by 0.6.0 — upgrade all consumers on a host together.
+- `Lease.queued_at` / `Lease.wait_sec` are stamped at promotion time so consumers can split "queued behind reslock" from "running on GPU" without timing the acquire themselves. `try_acquire` records `wait_sec=0.0` (no queue path); `_try_promote` computes `acquired_at - queued_at`. `LeaseHandle.gpu_uuids` and `LeaseHandle.gpu_torch_indices` derive GPU device lists from the lease's `gpu_{uuid}_vram_mb` resolved bindings (the latter is empty when CUDA/torch isn't available).
+- v3 hard-cut: `LeaseHandle.update()` no longer accepts `estimated_seconds` / `progress` (TypeError) — those moved to `EntryHandle.update()` on the attached entry. `pool.acquire(gpu_<uuid>_vram_mb=N)` keys are rejected — use `vram_mb_each` + `num_gpus` instead. Capacity registration via `set_resources()` still uses UUID-keyed entries. Coordinated consumer bump (scriba, aiserver, kirk-rpcserver) required at v0.8.0.
 
 ## Platform compatibility
 

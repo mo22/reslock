@@ -151,10 +151,20 @@ class EntryHandle:
         transact(self._pool._path, _update)  # pyright: ignore[reportPrivateUsage]
 
     def complete(self) -> None:
-        """Drop the entry. The Lease is unaffected."""
+        """Drop the entry from the queue. The Lease is unaffected.
+
+        Raises whatever ``transact()`` raises (lock timeout, OS error,
+        validation error). Callers MUST NOT swallow these silently — a
+        failed ``complete()`` leaves the entry attached to the lease, which
+        blocks reclaim and starves peer consumers. Retrying ``complete()``
+        is safe and idempotent: the handle is only marked completed once
+        the state write succeeds, so a re-call after a transient failure
+        will actually re-attempt the write rather than silently no-op.
+
+        See ``tests/test_complete_failure_semantics.py`` for the contract.
+        """
         if self._completed:
             return
-        self._completed = True
 
         entry_id = self._entry.id
 
@@ -162,6 +172,7 @@ class EntryHandle:
             state.queue = [e for e in state.queue if e.id != entry_id]
 
         transact(self._pool._path, _complete)  # pyright: ignore[reportPrivateUsage]
+        self._completed = True
 
     def __enter__(self) -> EntryHandle:
         return self

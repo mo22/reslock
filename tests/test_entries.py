@@ -265,3 +265,59 @@ def test_active_lease_ids_returns_attached_lease_ids(tmp_path: Path) -> None:
 
     transact(path, _check)
     lease.release()
+
+
+# --- complete() failure semantics ---
+
+
+def test_complete_retries_after_transient_transact_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed ``complete()`` must surface the error AND leave the handle
+    re-callable so a retry can actually clear the entry.
+
+    Regression for the SCRIBA-384 / aiserver-kirk wedge incident
+    (2026-05-30): the prior implementation set ``_completed=True`` before
+    the state write, so any swallowed exception from ``transact()`` would
+    permanently leak the entry — every subsequent ``complete()`` returned
+    early without touching the state file.
+    """
+    from collections.abc import Callable
+    from typing import Any
+
+    import reslock.pool as pool_mod
+
+    pool = _make_pool(tmp_path, ram_mb=4000)
+    lease = pool.try_acquire(ram_mb=1000, reclaimable=True)
+    assert lease is not None
+    entry = lease.start_work(estimated_seconds=30, label="probe")
+    assert len(pool.status().queue) == 1
+
+    real_transact = pool_mod.transact
+    fail_once = {"armed": True}
+
+    def flaky_transact(path: Path, fn: Callable[[State], Any]) -> Any:
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise OSError("simulated transient state-file failure")
+        return real_transact(path, fn)
+
+    monkeypatch.setattr(pool_mod, "transact", flaky_transact)
+
+    # 1) First call surfaces the error — callers cannot swallow it silently
+    #    without explicitly catching.
+    with pytest.raises(OSError, match="simulated transient"):
+        entry.complete()
+
+    # 2) Entry is still in the queue; failed complete() must NOT silently
+    #    mark the lease as released.
+    assert len(pool.status().queue) == 1
+
+    # 3) Retry succeeds — the handle did not latch ``_completed=True`` on the
+    #    failed attempt.
+    entry.complete()
+    assert pool.status().queue == []
+
+    # 4) Subsequent complete() calls are idempotent no-ops.
+    entry.complete()
+    lease.release()

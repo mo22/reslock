@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections.abc import Generator
@@ -31,6 +32,8 @@ from reslock.state import (
     read_state_clean,
     transact,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -248,6 +251,17 @@ class LeaseHandle:
             return []
 
     @property
+    def resources(self) -> dict[str, int]:
+        """The lease's current resource reservation (a copy).
+
+        Keyed by resource name — for GPU VRAM the resolved
+        ``gpu_<uuid>_vram_mb`` form. Reflects the cached lease, kept in sync
+        by :meth:`update` / :meth:`shrink`. Returns a copy so callers can't
+        mutate the lease's reservation in place.
+        """
+        return dict(self._lease.resources)
+
+    @property
     def reclaim_requested(self) -> bool:
         """Check the state file for whether reclaim has been requested."""
         state = read_state(self._pool._path)  # pyright: ignore[reportPrivateUsage]
@@ -282,6 +296,7 @@ class LeaseHandle:
         actual_resources: dict[str, int] | None = None,
         cpu_seconds: float | None = None,
         pids: list[int] | None = None,
+        resources: dict[str, int] | None = None,
         auto_detect: bool = False,
         **kwargs: object,
     ) -> None:
@@ -291,6 +306,15 @@ class LeaseHandle:
             actual_resources: Actual resource usage (e.g., ``{"vram_mb": 4000, "ram_mb": 1200}``).
             cpu_seconds: CPU time consumed so far.
             pids: Additional PIDs to monitor (e.g., child processes).
+            resources: New resource reservation for the lease (e.g. shrinking an
+                over-conservative VRAM estimate down to the measured footprint).
+                **Shrink-only and subset-only:** keys must be a subset of the
+                lease's current ``resources`` keys (no new GPUs/resources), every
+                value must be ``> 0``, and ``sum(new) <= sum(current)`` (a grow is
+                rejected). Raises ``ValueError`` otherwise. The live NVML
+                cross-check in placement is the OOM backstop, so a shrink can only
+                remove over-conservatism — it can never place a lease into VRAM
+                NVML reports as really used.
             auto_detect: If True, automatically detect actual_resources and cpu_seconds
                 using OS APIs and torch (if loaded).
 
@@ -318,6 +342,27 @@ class LeaseHandle:
             if cpu is not None and cpu_seconds is None:
                 cpu_seconds = cpu
 
+        old_total: int | None = None
+        new_total: int | None = None
+        if resources is not None:
+            current = self._lease.resources
+            unknown = set(resources) - set(current)
+            if unknown:
+                raise ValueError(
+                    f"resources update introduces keys not held by the lease: "
+                    f"{sorted(unknown)} (has: {sorted(current)})"
+                )
+            nonpositive = {k: v for k, v in resources.items() if v <= 0}
+            if nonpositive:
+                raise ValueError(f"resource values must be > 0, got {nonpositive}")
+            old_total = sum(current.values())
+            new_total = sum(resources.values())
+            if new_total > old_total:
+                raise ValueError(
+                    f"resources update must be shrink-only: "
+                    f"sum(new)={new_total} > sum(current)={old_total}"
+                )
+
         def _update(state: State) -> None:
             for lease in state.leases:
                 if lease.id == self._lease.id:
@@ -327,9 +372,22 @@ class LeaseHandle:
                         lease.cpu_seconds = cpu_seconds
                     if pids is not None:
                         lease.pids = pids
+                    if resources is not None:
+                        lease.resources = dict(resources)
                     break
 
         transact(self._pool._path, _update)  # pyright: ignore[reportPrivateUsage]
+
+        if resources is not None:
+            # Keep the cached lease in sync so handle.resources / gpu_uuids /
+            # gpu_torch_indices reflect the shrunk reservation.
+            self._lease.resources = dict(resources)
+            logger.info(
+                "lease %s resources shrunk %dMB -> %dMB",
+                self._lease.id,
+                old_total,
+                new_total,
+            )
 
     def start_work(
         self,
@@ -425,6 +483,7 @@ class LeaseHandle:
                 raise ValueError(f"shrink amount for {key!r} must be non-negative, got {delta}")
 
         should_release: list[bool] = []
+        new_resources: list[dict[str, int]] = []
 
         def _shrink(state: State) -> None:
             for lease in state.leases:
@@ -448,9 +507,15 @@ class LeaseHandle:
                         lease.resources[key] = new_val
                 if not lease.resources:
                     should_release.append(True)
+                new_resources.append(dict(lease.resources))
                 break
 
         transact(self._pool._path, _shrink)  # pyright: ignore[reportPrivateUsage]
+
+        # Keep the cached lease in sync so handle.resources / gpu_uuids reflect
+        # the post-shrink reservation (mirrors update(resources=)).
+        if new_resources:
+            self._lease.resources = new_resources[0]
 
         if should_release:
             self.release()

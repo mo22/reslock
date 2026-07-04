@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 
-from reslock.detect import gpu_vram_key
+from reslock.detect import CPU_CORES_KEY, RAM_MB_KEY, gpu_vram_key
 
 # ---------------------------------------------------------------------------
 # GPU VRAM
@@ -110,7 +110,83 @@ def detect_cpu_cores() -> dict[str, int]:
     except AttributeError:
         # macOS / systems without sched_getaffinity
         count = os.cpu_count() or 1
-    return {"cpu_cores": count}
+    return {CPU_CORES_KEY: count}
+
+
+# ---------------------------------------------------------------------------
+# RAM
+# ---------------------------------------------------------------------------
+
+
+def _total_ram_mb() -> int | None:
+    """Total physical RAM in MB, honoring cgroup limits inside containers."""
+    total_bytes: int | None = None
+    if sys.platform == "linux":
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        total_bytes = int(line.split()[1]) * 1024
+                        break
+        except (OSError, ValueError, IndexError):
+            pass
+        # A cgroup memory limit (container) caps what this consumer can use.
+        for limit_path in (
+            "/sys/fs/cgroup/memory.max",  # cgroup v2
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+        ):
+            try:
+                with open(limit_path) as f:
+                    raw = f.read().strip()
+                if raw != "max":
+                    limit = int(raw)
+                    if total_bytes is None or limit < total_bytes:
+                        total_bytes = limit
+                break
+            except (OSError, ValueError):
+                continue
+    elif sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                total_bytes = int(result.stdout.strip())
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            pass
+    if total_bytes is None:
+        return None
+    return total_bytes // (1024 * 1024)
+
+
+def detect_ram_mb(reserve_mb: int = 0) -> dict[str, int]:
+    """Detect total system RAM in MB, minus a configurable reserve.
+
+    Args:
+        reserve_mb: Headroom to keep out of the pool (OS, page cache,
+            non-reslock processes). The registered capacity is
+            ``MemTotal - reserve_mb``.
+
+    Returns ``{"ram_mb": N}``, or an empty dict if RAM cannot be detected
+    (matching the other ``detect_*`` functions). Inside a Linux container,
+    a cgroup memory limit lower than the host's MemTotal wins.
+
+    Raises:
+        ValueError: If ``reserve_mb`` is negative or leaves no capacity
+            (``reserve_mb >= MemTotal``) — a misconfigured reserve should
+            surface loudly rather than silently register nothing.
+    """
+    if reserve_mb < 0:
+        raise ValueError(f"reserve_mb must be non-negative, got {reserve_mb}")
+    total = _total_ram_mb()
+    if total is None:
+        return {}
+    if reserve_mb >= total:
+        raise ValueError(f"reserve_mb={reserve_mb} leaves no capacity (detected {total} MB total)")
+    return {RAM_MB_KEY: total - reserve_mb}
 
 
 # ---------------------------------------------------------------------------

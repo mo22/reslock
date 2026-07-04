@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from reslock.detect import (
+    CPU_CORES_KEY,
+    RAM_MB_KEY,
     get_host_pid,
     get_self_actual_resources,
     get_self_cpu_seconds,
@@ -71,6 +73,27 @@ def _validate_non_gpu(non_gpu: dict[str, int]) -> None:
                 "Capacity registration via set_resources() still uses "
                 "gpu_<uuid>_vram_mb keys."
             )
+
+
+def _fold_first_class(
+    non_gpu: dict[str, int], cpu_cores: int | None, ram_mb: int | None
+) -> dict[str, int]:
+    """Fold the first-class ``cpu_cores`` / ``ram_mb`` kwargs into the non-GPU demand dict.
+
+    These are ordinary counter resources under the standard keys
+    (``CPU_CORES_KEY`` / ``RAM_MB_KEY``) — the explicit kwargs exist so
+    consumers converge on one spelling instead of inventing ``mem_mb`` /
+    ``host_ram`` variants. Values must be positive: a zero ask is a no-op
+    that almost certainly means a bug at the call site.
+    """
+    merged = dict(non_gpu)
+    for key, val in ((CPU_CORES_KEY, cpu_cores), (RAM_MB_KEY, ram_mb)):
+        if val is None:
+            continue
+        if val <= 0:
+            raise ValueError(f"{key} must be a positive int, got {val}")
+        merged[key] = val
+    return merged
 
 
 def _detect_host_pid() -> int | None:
@@ -533,6 +556,8 @@ class ResourcePool:
         *,
         vram_mb_each: int | None = None,
         num_gpus: int = 0,
+        cpu_cores: int | None = None,
+        ram_mb: int | None = None,
         priority: int = 0,
         reclaimable: bool = False,
         estimated_seconds: int | None = None,
@@ -547,6 +572,12 @@ class ResourcePool:
             num_gpus: Number of GPUs needed (any). The scheduler picks UUIDs
                 at promotion time using spread placement (most-free first,
                 ties by UUID).
+            cpu_cores: CPU cores to reserve (host-global counter under the
+                standard ``cpu_cores`` key). Register capacity via
+                ``set_resources(detect_cpu_cores())``.
+            ram_mb: System RAM in MB to reserve (host-global counter under
+                the standard ``ram_mb`` key). Register capacity via
+                ``set_resources(detect_ram_mb(reserve_mb=...))``.
             priority: Higher-priority waiters jump ahead in the queue.
             reclaimable: Allow this lease to be evicted by higher-priority
                 requests when resources are short. Reclaim is blocked while
@@ -556,15 +587,15 @@ class ResourcePool:
                 ``lease.entry``. Auto-completed on release.
             label: Human-readable label for diagnostics.
             poll_interval: Seconds between scheduler polls.
-            **non_gpu_resources: Non-GPU resource demands (e.g. ``ram_mb=8000``).
-                ``gpu_<uuid>_vram_mb`` keys are rejected — use ``vram_mb_each``
-                + ``num_gpus`` instead.
+            **non_gpu_resources: Additional non-GPU resource demands under
+                free-form keys. ``gpu_<uuid>_vram_mb`` keys are rejected —
+                use ``vram_mb_each`` + ``num_gpus`` instead.
         """
         _validate_non_gpu(non_gpu_resources)
         handle = self._acquire_blocking(
             vram_mb_each=vram_mb_each,
             num_gpus=num_gpus,
-            non_gpu=non_gpu_resources,
+            non_gpu=_fold_first_class(non_gpu_resources, cpu_cores, ram_mb),
             priority=priority,
             reclaimable=reclaimable,
             estimated_seconds=estimated_seconds,
@@ -581,6 +612,8 @@ class ResourcePool:
         *,
         vram_mb_each: int | None = None,
         num_gpus: int = 0,
+        cpu_cores: int | None = None,
+        ram_mb: int | None = None,
         priority: int = 0,
         reclaimable: bool = False,
         estimated_seconds: int | None = None,
@@ -593,7 +626,7 @@ class ResourcePool:
         new_entry = self._enqueue(
             vram_mb_each=vram_mb_each,
             num_gpus=num_gpus,
-            non_gpu=non_gpu_resources,
+            non_gpu=_fold_first_class(non_gpu_resources, cpu_cores, ram_mb),
             priority=priority,
             reclaimable=reclaimable,
             label=label,
@@ -614,6 +647,8 @@ class ResourcePool:
         *,
         vram_mb_each: int | None = None,
         num_gpus: int = 0,
+        cpu_cores: int | None = None,
+        ram_mb: int | None = None,
         priority: int = 0,
         reclaimable: bool = False,
         estimated_seconds: int | None = None,
@@ -622,6 +657,7 @@ class ResourcePool:
     ) -> LeaseHandle | None:
         """Try to acquire resources without queueing. Returns ``None`` if the request can't fit."""
         _validate_non_gpu(non_gpu_resources)
+        non_gpu_resources = _fold_first_class(non_gpu_resources, cpu_cores, ram_mb)
         pid = os.getpid()
         host_pid = self._host_pid
 

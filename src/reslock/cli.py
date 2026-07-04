@@ -16,7 +16,6 @@ from rich.console import Console
 from rich.table import Table
 
 from reslock.detect import (
-    detect_gpu_vram_mb,
     get_all_pid_vram_mb,
     get_all_pid_vram_per_gpu_mb,
     get_pid_cpu_seconds,
@@ -25,6 +24,7 @@ from reslock.detect import (
 )
 from reslock.models import QueueEntry, State
 from reslock.pool import ResourcePool
+from reslock.resources import detect_cpu_cores, detect_gpu_vram_mb, detect_ram_mb
 from reslock.state import DEFAULT_STATE_PATH, ensure_state_file, transact
 
 console = Console()
@@ -50,32 +50,38 @@ def main() -> None:
 
 @main.command(deprecated=True)
 @click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
-def init(state: Path | None) -> None:
-    """Initialize reslock state file, auto-detecting per-GPU VRAM.
+@click.option(
+    "--ram-reserve",
+    default="0",
+    help="RAM headroom to keep out of the pool (e.g. 32G); registered capacity is total minus this",
+)
+def init(state: Path | None, ram_reserve: str) -> None:
+    """Initialize reslock state file, auto-detecting per-GPU VRAM, CPU cores, and RAM.
 
     Deprecated: prefer pool.set_resources() with the built-in detection
-    functions (e.g. detect_gpu_vram_mb()) — each consumer registers the
-    resources it knows about on startup.
+    functions (detect_gpu_vram_mb(), detect_cpu_cores(), detect_ram_mb()) —
+    each consumer registers the resources it knows about on startup.
     """
     path = state or DEFAULT_STATE_PATH
     ensure_state_file(path)
 
-    gpu = detect_gpu_vram_mb()
+    detected = detect_gpu_vram_mb()
+    detected.update(detect_cpu_cores())
+    detected.update(detect_ram_mb(reserve_mb=_parse_size(ram_reserve)))
 
     def _init(st: State) -> None:
-        for key, val in gpu.items():
+        for key, val in detected.items():
             if key not in st.resources:
                 st.resources[key] = val
 
     transact(path, _init)
 
-    if gpu:
-        for key, val in sorted(gpu.items()):
-            console.print(f"[green]Detected:[/green] {key}={val}")
+    for key, val in sorted(detected.items()):
+        console.print(f"[green]Detected:[/green] {key}={val}")
     console.print(f"[green]State file:[/green] {path}")
     console.print(
         "[yellow]Note:[/yellow] 'reslock init' is deprecated. "
-        "Prefer pool.set_resources() with detect_gpu_vram_mb() in your application startup."
+        "Prefer pool.set_resources() with the detect_* functions in your application startup."
     )
 
 

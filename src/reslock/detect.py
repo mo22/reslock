@@ -11,6 +11,21 @@ except ImportError:  # pragma: no cover — Windows has no POSIX resource module
     resource = None  # type: ignore[assignment]
 
 
+CPU_CORES_KEY = "cpu_cores"
+"""Standard resource key for CPU cores (host-global counter).
+
+Reserved extension for NUMA-aware scheduling (v2): ``cpu_cores@node<N>``
+per-node capacities alongside the host-global key. Resource keys are free-form
+strings, so this is additive — no schema bump needed.
+"""
+
+RAM_MB_KEY = "ram_mb"
+"""Standard resource key for system RAM in MB (host-global counter).
+
+Same NUMA reservation as ``CPU_CORES_KEY``: ``ram_mb@node<N>`` in v2.
+"""
+
+
 def gpu_vram_key(gpu_uuid: str) -> str:
     """Build the reslock resource key for a GPU UUID's VRAM."""
     return f"gpu_{gpu_uuid}_vram_mb"
@@ -392,7 +407,7 @@ def get_self_actual_resources() -> dict[str, int]:
     result: dict[str, int] = {}
     rss = get_self_rss_mb()
     if rss is not None and rss > 0:
-        result["ram_mb"] = rss
+        result[RAM_MB_KEY] = rss
     # Prefer torch CUDA measurement (more accurate, includes tensors)
     per_gpu = get_torch_cuda_per_gpu_mb()
     if per_gpu:

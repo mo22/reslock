@@ -100,18 +100,38 @@ reslock ships detection functions for common resource types. Dependencies like t
 | `detect_gpu_vram_mb_nvidia_smi()` | `gpu_{uuid}_vram_mb`, ... | nvidia-smi CLI only |
 | `gpu_resource_key(torch_index)` | `gpu_{uuid}_vram_mb` | maps local torch index → UUID key |
 | `detect_cpu_cores()` | `cpu_cores` | `os.sched_getaffinity` / `os.cpu_count` |
+| `detect_ram_mb(reserve_mb=...)` | `ram_mb` | `/proc/meminfo` + cgroup limits (Linux) / `sysctl hw.memsize` (macOS), minus a configurable reserve |
 | `detect_disk_mb(["/", "/data"])` | `disk_root_mb`, ... | `shutil.disk_usage` |
 | `detect_network_bandwidth()` | `net_eth0_mbps`, ... | sysfs (Linux) / networksetup (macOS) |
 
 Example startup:
 
 ```python
-from reslock import ResourcePool, detect_gpu_vram_mb, detect_cpu_cores
+from reslock import ResourcePool, detect_gpu_vram_mb, detect_cpu_cores, detect_ram_mb
 
 pool = ResourcePool()
 pool.set_resources(detect_gpu_vram_mb())
 pool.set_resources(detect_cpu_cores())
+pool.set_resources(detect_ram_mb(reserve_mb=32_000))  # keep 32 GB for OS / non-reslock processes
 ```
+
+### CPU / RAM as first-class counters
+
+`cpu_cores` and `ram_mb` are the standard keys for host-global CPU and RAM
+coordination (exported as `CPU_CORES_KEY` / `RAM_MB_KEY`). The acquire APIs
+take them as explicit kwargs so consumers converge on one spelling; queue,
+priority, and reclaim semantics are identical to the VRAM path:
+
+```python
+# Serialize big CPU-LLM instances against each other and against production:
+with pool.acquire(cpu_cores=48, ram_mb=650_000, label="kimi-k2.6") as lease:
+    serve_model()
+# A second acquire(cpu_cores=48, ram_mb=500_000) queues until this one releases.
+```
+
+The keys are host-global counters — no NUMA awareness yet. The naming is
+NUMA-open by design: a future version can add per-node capacities like
+`cpu_cores@node0` alongside the global keys without a schema change.
 
 ## CLI
 

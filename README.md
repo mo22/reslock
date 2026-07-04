@@ -133,22 +133,37 @@ The keys are host-global counters — no NUMA awareness yet. The naming is
 NUMA-open by design: a future version can add per-node capacities like
 `cpu_cores@node0` alongside the global keys without a schema change.
 
-### Disk: lease transient usage, only report persistent usage
+### Disk: free-space leases
 
-Disk capacity registers per mount via `detect_disk_mb(["/", "/data"])`
-(keys `disk_root_mb`, `disk_data_mb`, ...). Whether to *lease* disk depends
-on the usage shape:
+Disk uses **free-space admission** instead of registered capacity — no
+`set_resources()` needed. A disk lease reserves headroom for bytes you're
+about to write (a model download, conversion scratch space); admission is
+checked against live `statvfs` ground truth on every attempt:
 
-- **Transient usage** (scratch space for a conversion job, an in-flight
-  download) is lease-shaped: acquire it as an ordinary counter,
-  `pool.acquire(disk_data_mb=500_000)`, and it's freed on release — or
-  incrementally via `lease.shrink(disk_data_mb=...)` as the job cleans up.
-- **Persistent artifacts** (model weights that outlive the process) are
-  deliberately **not** leasable. Lease cleanup is PID-based — when the owning
-  process exits, the lease is dropped while the bytes remain, so a "storage
-  lease" would drift from reality immediately. Track persistent usage with
-  capacity reporting and consumer-side eviction policy instead (same
-  philosophy as `gpu_orphans()`: reslock diagnoses, consumers decide).
+> granted only while `request + sum(active disk leases on the mount) <= actual free`
+
+```python
+# Reserve 16 GB of free space on /data, download into it, return the lease:
+with pool.acquire(disk_mb=16_384, disk_path="/data", label="model-download") as lease:
+    download_model()   # if peers' reservations already cover the actual
+                       # free space, this acquire waits — no download
+```
+
+The lease key is `disk_mb@<mount>` (`disk_mb_key(path)` /
+`parse_disk_mb_key(key)`); mounts are independent. Because admission re-reads
+`statvfs` on every poll tick, externally written bytes shrink what can be
+granted — the same drift-handling idea as the NVML VRAM pre-flight. Once your
+download finishes and the lease is released, the written bytes are visible in
+`statvfs` itself, so persistent storage needs no long-lived lease. During a
+long write, your own landed bytes are double-counted (they reduce actual free
+while your reservation still covers them) — that's conservative by design;
+`lease.shrink(**{"disk_mb@/data": written_mb})` returns the headroom
+incrementally if peers shouldn't wait.
+
+`reslock status` shows a per-mount view (actual free / leased / headroom) for
+every mount with active disk leases, and `reslock run --disk 16G --disk-path
+/data ...` works like `--ram`/`--cpu`. `detect_disk_mb()` (static *total*
+capacity as plain counters) remains for custom accounting schemes.
 
 ## CLI
 

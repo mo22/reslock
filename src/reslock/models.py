@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from reslock.detect import gpu_vram_key, parse_gpu_vram_key
+from reslock.detect import gpu_vram_key, parse_disk_mb_key, parse_gpu_vram_key
 
 
 def _utcnow() -> datetime:
@@ -166,6 +166,7 @@ class State(BaseModel):
         num_gpus: int,
         non_gpu: dict[str, int],
         nvml_free: dict[str, int] | None = None,
+        disk_free: dict[str, int] | None = None,
     ) -> dict[str, int] | None:
         """Resolve an abstract resource request into a concrete bindings dict.
 
@@ -184,6 +185,12 @@ class State(BaseModel):
                 picks. UUIDs missing from *nvml_free* are treated as 0 free
                 (conservative: a GPU we registered but the driver didn't
                 report counts as fully held externally).
+            disk_free: Actual free disk space (statvfs) per ``disk_mb@<path>``
+                key. Disk keys use free-space admission instead of registered
+                capacity: grant only while ``request + sum(active disk leases
+                on the key) <= actual free``. A disk key missing from
+                *disk_free* refuses (no ground truth, conservative) — the pool
+                supplies it via ``get_disk_free_mb()`` before every attempt.
 
         Returns:
             A ``{key: amount}`` dict suitable for storing on a ``Lease`` —
@@ -215,10 +222,17 @@ class State(BaseModel):
             )
 
         avail_non_gpu = self.available()
+        used = self.used_per_key()
         for key, val in non_gpu.items():
             if val < 0:
                 raise ValueError(f"resource {key!r} amount must be non-negative, got {val}")
-            if val > avail_non_gpu.get(key, 0):
+            if parse_disk_mb_key(key) is not None:
+                # Free-space admission: leases reserve headroom against the
+                # live statvfs value, not a registered capacity.
+                free = (disk_free or {}).get(key)
+                if free is None or val > free - used.get(key, 0):
+                    return None
+            elif val > avail_non_gpu.get(key, 0):
                 return None
 
         bindings: dict[str, int] = dict(non_gpu)

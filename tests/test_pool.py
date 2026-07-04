@@ -122,67 +122,67 @@ def test_status_cleans_dead_leases(tmp_path: Path) -> None:
 
 
 def test_shrink_reduces_available(tmp_path: Path) -> None:
-    pool = _make_pool(tmp_path, disk_mb=12000)
-    lease = pool.try_acquire(disk_mb=12000)
+    pool = _make_pool(tmp_path, scratch_mb=12000)
+    lease = pool.try_acquire(scratch_mb=12000)
     assert lease is not None
-    assert pool.status().available["disk_mb"] == 0
-    lease.shrink(disk_mb=4000)
-    assert pool.status().available["disk_mb"] == 4000
-    lease.shrink(disk_mb=3000)
-    assert pool.status().available["disk_mb"] == 7000
+    assert pool.status().available["scratch_mb"] == 0
+    lease.shrink(scratch_mb=4000)
+    assert pool.status().available["scratch_mb"] == 4000
+    lease.shrink(scratch_mb=3000)
+    assert pool.status().available["scratch_mb"] == 7000
     lease.release()
-    assert pool.status().available["disk_mb"] == 12000
+    assert pool.status().available["scratch_mb"] == 12000
 
 
 def test_shrink_to_zero_releases_lease(tmp_path: Path) -> None:
-    pool = _make_pool(tmp_path, disk_mb=5000)
-    lease = pool.try_acquire(disk_mb=5000)
+    pool = _make_pool(tmp_path, scratch_mb=5000)
+    lease = pool.try_acquire(scratch_mb=5000)
     assert lease is not None
-    lease.shrink(disk_mb=5000)
+    lease.shrink(scratch_mb=5000)
     st = pool.status()
     assert len(st.leases) == 0
-    assert st.available["disk_mb"] == 5000
+    assert st.available["scratch_mb"] == 5000
     # Further shrinks are no-ops (already released).
-    lease.shrink(disk_mb=1)
+    lease.shrink(scratch_mb=1)
 
 
 def test_shrink_partial_to_zero_keeps_lease(tmp_path: Path) -> None:
     """A multi-resource lease stays alive as long as any key has capacity."""
-    pool = _make_pool(tmp_path, disk_mb=8000, ram_mb=4000)
-    lease = pool.try_acquire(disk_mb=8000, ram_mb=4000)
+    pool = _make_pool(tmp_path, scratch_mb=8000, ram_mb=4000)
+    lease = pool.try_acquire(scratch_mb=8000, ram_mb=4000)
     assert lease is not None
-    lease.shrink(disk_mb=8000)
+    lease.shrink(scratch_mb=8000)
     st = pool.status()
     assert len(st.leases) == 1
-    assert "disk_mb" not in st.leases[0].resources
+    assert "scratch_mb" not in st.leases[0].resources
     assert st.leases[0].resources == {"ram_mb": 4000}
-    assert st.available == {"disk_mb": 8000, "ram_mb": 0}
+    assert st.available == {"scratch_mb": 8000, "ram_mb": 0}
 
 
 def test_shrink_negative_raises(tmp_path: Path) -> None:
-    pool = _make_pool(tmp_path, disk_mb=5000)
-    lease = pool.try_acquire(disk_mb=5000)
+    pool = _make_pool(tmp_path, scratch_mb=5000)
+    lease = pool.try_acquire(scratch_mb=5000)
     assert lease is not None
     with pytest.raises(ValueError, match="non-negative"):
-        lease.shrink(disk_mb=-1)
+        lease.shrink(scratch_mb=-1)
     # State must be unchanged on rejection.
-    assert pool.status().available["disk_mb"] == 0
+    assert pool.status().available["scratch_mb"] == 0
     lease.release()
 
 
 def test_shrink_below_zero_raises(tmp_path: Path) -> None:
-    pool = _make_pool(tmp_path, disk_mb=5000)
-    lease = pool.try_acquire(disk_mb=1000)
+    pool = _make_pool(tmp_path, scratch_mb=5000)
+    lease = pool.try_acquire(scratch_mb=1000)
     assert lease is not None
     with pytest.raises(ValueError, match="below zero"):
-        lease.shrink(disk_mb=2000)
-    assert pool.status().available["disk_mb"] == 4000
+        lease.shrink(scratch_mb=2000)
+    assert pool.status().available["scratch_mb"] == 4000
     lease.release()
 
 
 def test_shrink_unknown_key_raises(tmp_path: Path) -> None:
-    pool = _make_pool(tmp_path, disk_mb=5000)
-    lease = pool.try_acquire(disk_mb=1000)
+    pool = _make_pool(tmp_path, scratch_mb=5000)
+    lease = pool.try_acquire(scratch_mb=1000)
     assert lease is not None
     with pytest.raises(ValueError, match="does not hold"):
         lease.shrink(vram_mb=100)
@@ -190,13 +190,13 @@ def test_shrink_unknown_key_raises(tmp_path: Path) -> None:
 
 
 def test_shrink_after_release_is_noop(tmp_path: Path) -> None:
-    pool = _make_pool(tmp_path, disk_mb=5000)
-    lease = pool.try_acquire(disk_mb=5000)
+    pool = _make_pool(tmp_path, scratch_mb=5000)
+    lease = pool.try_acquire(scratch_mb=5000)
     assert lease is not None
     lease.release()
     # No exception, no state change.
-    lease.shrink(disk_mb=1000)
-    assert pool.status().available["disk_mb"] == 5000
+    lease.shrink(scratch_mb=1000)
+    assert pool.status().available["scratch_mb"] == 5000
 
 
 def test_try_acquire_wait_sec_zero(tmp_path: Path) -> None:
@@ -275,18 +275,18 @@ def test_lease_handle_gpu_uuids_empty_without_gpu_keys(tmp_path: Path) -> None:
 
 def test_update_resources_shrinks_reservation(tmp_path: Path) -> None:
     """update(resources=) sets a smaller reservation; state + available reflect it."""
-    pool = _make_pool(tmp_path, disk_mb=8000, ram_mb=4000)
-    lease = pool.try_acquire(disk_mb=8000, ram_mb=4000)
+    pool = _make_pool(tmp_path, scratch_mb=8000, ram_mb=4000)
+    lease = pool.try_acquire(scratch_mb=8000, ram_mb=4000)
     assert lease is not None
-    assert pool.status().available == {"disk_mb": 0, "ram_mb": 0}
+    assert pool.status().available == {"scratch_mb": 0, "ram_mb": 0}
 
-    lease.update(resources={"disk_mb": 4000, "ram_mb": 2000})
+    lease.update(resources={"scratch_mb": 4000, "ram_mb": 2000})
 
     st = pool.status()
-    assert st.leases[0].resources == {"disk_mb": 4000, "ram_mb": 2000}
-    assert st.available == {"disk_mb": 4000, "ram_mb": 2000}
+    assert st.leases[0].resources == {"scratch_mb": 4000, "ram_mb": 2000}
+    assert st.available == {"scratch_mb": 4000, "ram_mb": 2000}
     # Cached handle reflects the shrunk set.
-    assert lease.resources == {"disk_mb": 4000, "ram_mb": 2000}
+    assert lease.resources == {"scratch_mb": 4000, "ram_mb": 2000}
     lease.release()
 
 
@@ -350,33 +350,33 @@ def test_update_resources_keeps_per_gpu_ratio(tmp_path: Path) -> None:
 
 
 def test_update_resources_rejects_grow(tmp_path: Path) -> None:
-    pool = _make_pool(tmp_path, disk_mb=8000)
-    lease = pool.try_acquire(disk_mb=4000)
+    pool = _make_pool(tmp_path, scratch_mb=8000)
+    lease = pool.try_acquire(scratch_mb=4000)
     assert lease is not None
     with pytest.raises(ValueError, match="shrink-only"):
-        lease.update(resources={"disk_mb": 5000})
+        lease.update(resources={"scratch_mb": 5000})
     # State unchanged on rejection.
-    assert pool.status().leases[0].resources == {"disk_mb": 4000}
+    assert pool.status().leases[0].resources == {"scratch_mb": 4000}
     lease.release()
 
 
 def test_update_resources_rejects_unknown_key(tmp_path: Path) -> None:
-    pool = _make_pool(tmp_path, disk_mb=8000)
-    lease = pool.try_acquire(disk_mb=4000)
+    pool = _make_pool(tmp_path, scratch_mb=8000)
+    lease = pool.try_acquire(scratch_mb=4000)
     assert lease is not None
     with pytest.raises(ValueError, match="not held by the lease"):
         lease.update(resources={"vram_mb": 100})
-    assert pool.status().leases[0].resources == {"disk_mb": 4000}
+    assert pool.status().leases[0].resources == {"scratch_mb": 4000}
     lease.release()
 
 
 def test_update_resources_rejects_nonpositive(tmp_path: Path) -> None:
-    pool = _make_pool(tmp_path, disk_mb=8000)
-    lease = pool.try_acquire(disk_mb=4000)
+    pool = _make_pool(tmp_path, scratch_mb=8000)
+    lease = pool.try_acquire(scratch_mb=4000)
     assert lease is not None
     with pytest.raises(ValueError, match="must be > 0"):
-        lease.update(resources={"disk_mb": 0})
-    assert pool.status().leases[0].resources == {"disk_mb": 4000}
+        lease.update(resources={"scratch_mb": 0})
+    assert pool.status().leases[0].resources == {"scratch_mb": 4000}
     lease.release()
 
 
@@ -399,14 +399,14 @@ def test_update_resources_reflected_in_gpu_uuids(tmp_path: Path) -> None:
 
 def test_shrink_promotes_queued_waiter(tmp_path: Path) -> None:
     """A waiter blocked on capacity should unblock once shrink() frees enough."""
-    pool = _make_pool(tmp_path, disk_mb=10000)
-    holder = pool.try_acquire(disk_mb=10000)
+    pool = _make_pool(tmp_path, scratch_mb=10000)
+    holder = pool.try_acquire(scratch_mb=10000)
     assert holder is not None
 
     acquired = threading.Event()
 
     def _waiter() -> None:
-        with pool.acquire(disk_mb=4000, poll_interval=0.05):
+        with pool.acquire(scratch_mb=4000, poll_interval=0.05):
             acquired.set()
 
     t = threading.Thread(target=_waiter)
@@ -416,7 +416,7 @@ def test_shrink_promotes_queued_waiter(tmp_path: Path) -> None:
         time.sleep(0.2)
         assert not acquired.is_set()
 
-        holder.shrink(disk_mb=4000)
+        holder.shrink(scratch_mb=4000)
 
         assert acquired.wait(timeout=2.0), "waiter did not unblock after shrink"
     finally:

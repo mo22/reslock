@@ -13,10 +13,13 @@ from typing import TYPE_CHECKING
 from reslock.detect import (
     CPU_CORES_KEY,
     RAM_MB_KEY,
+    disk_mb_key,
+    get_disk_free_mb,
     get_host_pid,
     get_self_actual_resources,
     get_self_cpu_seconds,
     gpu_vram_key,
+    parse_disk_mb_key,
     parse_gpu_vram_key,
 )
 
@@ -57,6 +60,42 @@ def _read_nvml_for_request(num_gpus: int) -> dict[str, int] | None:
     return nvml_free_vram_mb()
 
 
+def _read_disk_free_for_request(non_gpu: dict[str, int]) -> dict[str, int] | None:
+    """Read statvfs ground truth for every ``disk_mb@<path>`` key in the request.
+
+    Returns ``{key: actual_free_mb}``, or ``None`` when the request holds no
+    disk keys. Raises ``ValueError`` when a mount path can't be statted — a
+    typo'd path should fail the acquire loudly, not queue forever against a
+    key the scheduler will always refuse.
+    """
+    disk_free: dict[str, int] = {}
+    for key in non_gpu:
+        path = parse_disk_mb_key(key)
+        if path is None:
+            continue
+        free = get_disk_free_mb(path)
+        if free is None:
+            raise ValueError(f"cannot stat free disk space for {key!r} (path {path!r})")
+        disk_free[key] = free
+    return disk_free or None
+
+
+def _gate_disk_free(non_gpu: dict[str, int]) -> dict[str, int] | None:
+    """Tolerant variant of :func:`_read_disk_free_for_request` for gate entries.
+
+    A peer's queue entry may reference a path we can't stat; treating it as
+    0 free (entry can't fit → doesn't block us) beats raising and killing
+    our own acquire.
+    """
+    disk_free: dict[str, int] = {}
+    for key in non_gpu:
+        path = parse_disk_mb_key(key)
+        if path is None:
+            continue
+        disk_free[key] = get_disk_free_mb(path) or 0
+    return disk_free or None
+
+
 def _validate_non_gpu(non_gpu: dict[str, int]) -> None:
     """Reject ``gpu_<uuid>_vram_mb`` keys passed via the legacy v2 acquire shape.
 
@@ -76,15 +115,24 @@ def _validate_non_gpu(non_gpu: dict[str, int]) -> None:
 
 
 def _fold_first_class(
-    non_gpu: dict[str, int], cpu_cores: int | None, ram_mb: int | None
+    non_gpu: dict[str, int],
+    cpu_cores: int | None,
+    ram_mb: int | None,
+    disk_mb: int | None = None,
+    disk_path: str | None = None,
 ) -> dict[str, int]:
-    """Fold the first-class ``cpu_cores`` / ``ram_mb`` kwargs into the non-GPU demand dict.
+    """Fold the first-class ``cpu_cores`` / ``ram_mb`` / ``disk_mb`` kwargs into
+    the non-GPU demand dict.
 
-    These are ordinary counter resources under the standard keys
-    (``CPU_CORES_KEY`` / ``RAM_MB_KEY``) — the explicit kwargs exist so
-    consumers converge on one spelling instead of inventing ``mem_mb`` /
-    ``host_ram`` variants. Values must be positive: a zero ask is a no-op
-    that almost certainly means a bug at the call site.
+    ``cpu_cores`` / ``ram_mb`` are ordinary counter resources under the
+    standard keys (``CPU_CORES_KEY`` / ``RAM_MB_KEY``) — the explicit kwargs
+    exist so consumers converge on one spelling instead of inventing
+    ``mem_mb`` / ``host_ram`` variants. ``disk_mb`` becomes a free-space
+    lease key ``disk_mb@<disk_path>`` (default mount ``/``) with statvfs-based
+    admission. Values must be positive: a zero ask is a no-op that almost
+    certainly means a bug at the call site. ``disk_path`` without ``disk_mb``
+    raises — silently ignoring it would grant a lease with no disk
+    reservation (same reasoning as ``vram_mb_each`` without ``num_gpus``).
     """
     merged = dict(non_gpu)
     for key, val in ((CPU_CORES_KEY, cpu_cores), (RAM_MB_KEY, ram_mb)):
@@ -93,6 +141,15 @@ def _fold_first_class(
         if val <= 0:
             raise ValueError(f"{key} must be a positive int, got {val}")
         merged[key] = val
+    if disk_mb is not None:
+        if disk_mb <= 0:
+            raise ValueError(f"disk_mb must be a positive int, got {disk_mb}")
+        merged[disk_mb_key(disk_path or "/")] = disk_mb
+    elif disk_path is not None:
+        raise ValueError(
+            f"disk_path={disk_path!r} requires disk_mb; "
+            "set disk_mb to the free space to reserve or drop disk_path"
+        )
     return merged
 
 
@@ -482,9 +539,12 @@ class LeaseHandle:
 
         Args:
             **resources: Amount to decrement per resource key
-                (e.g. ``disk_mb=500`` subtracts 500 from the current reservation).
+                (e.g. ``ram_mb=500`` subtracts 500 from the current reservation).
                 Values must be non-negative. For GPU VRAM the key is the
-                resolved ``gpu_<uuid>_vram_mb`` form — non-GPU shrinks are
+                resolved ``gpu_<uuid>_vram_mb`` form; for disk the
+                ``disk_mb@<path>`` form (pass via ``**{...}``) — shrinking a
+                disk lease as bytes land avoids double-counting the written
+                bytes against the remaining reservation. Non-GPU shrinks are
                 the typical use.
 
         Raises:
@@ -558,6 +618,8 @@ class ResourcePool:
         num_gpus: int = 0,
         cpu_cores: int | None = None,
         ram_mb: int | None = None,
+        disk_mb: int | None = None,
+        disk_path: str | None = None,
         priority: int = 0,
         reclaimable: bool = False,
         estimated_seconds: int | None = None,
@@ -578,6 +640,15 @@ class ResourcePool:
             ram_mb: System RAM in MB to reserve (host-global counter under
                 the standard ``ram_mb`` key). Register capacity via
                 ``set_resources(detect_ram_mb(reserve_mb=...))``.
+            disk_mb: Free disk space in MB to reserve on ``disk_path``
+                (key ``disk_mb@<path>``). No capacity registration —
+                admission is against live statvfs: granted only while
+                ``request + sum(active disk leases on the mount) <= actual
+                free``. Reserve before writing (a download, scratch space),
+                write, release; ``shrink()`` as bytes land to avoid
+                double-counting against peers.
+            disk_path: Mount path for ``disk_mb`` (default ``/``). Requires
+                ``disk_mb``.
             priority: Higher-priority waiters jump ahead in the queue.
             reclaimable: Allow this lease to be evicted by higher-priority
                 requests when resources are short. Reclaim is blocked while
@@ -595,7 +666,7 @@ class ResourcePool:
         handle = self._acquire_blocking(
             vram_mb_each=vram_mb_each,
             num_gpus=num_gpus,
-            non_gpu=_fold_first_class(non_gpu_resources, cpu_cores, ram_mb),
+            non_gpu=_fold_first_class(non_gpu_resources, cpu_cores, ram_mb, disk_mb, disk_path),
             priority=priority,
             reclaimable=reclaimable,
             estimated_seconds=estimated_seconds,
@@ -614,6 +685,8 @@ class ResourcePool:
         num_gpus: int = 0,
         cpu_cores: int | None = None,
         ram_mb: int | None = None,
+        disk_mb: int | None = None,
+        disk_path: str | None = None,
         priority: int = 0,
         reclaimable: bool = False,
         estimated_seconds: int | None = None,
@@ -626,7 +699,7 @@ class ResourcePool:
         new_entry = self._enqueue(
             vram_mb_each=vram_mb_each,
             num_gpus=num_gpus,
-            non_gpu=_fold_first_class(non_gpu_resources, cpu_cores, ram_mb),
+            non_gpu=_fold_first_class(non_gpu_resources, cpu_cores, ram_mb, disk_mb, disk_path),
             priority=priority,
             reclaimable=reclaimable,
             label=label,
@@ -649,6 +722,8 @@ class ResourcePool:
         num_gpus: int = 0,
         cpu_cores: int | None = None,
         ram_mb: int | None = None,
+        disk_mb: int | None = None,
+        disk_path: str | None = None,
         priority: int = 0,
         reclaimable: bool = False,
         estimated_seconds: int | None = None,
@@ -657,14 +732,18 @@ class ResourcePool:
     ) -> LeaseHandle | None:
         """Try to acquire resources without queueing. Returns ``None`` if the request can't fit."""
         _validate_non_gpu(non_gpu_resources)
-        non_gpu_resources = _fold_first_class(non_gpu_resources, cpu_cores, ram_mb)
+        non_gpu_resources = _fold_first_class(
+            non_gpu_resources, cpu_cores, ram_mb, disk_mb, disk_path
+        )
         pid = os.getpid()
         host_pid = self._host_pid
 
-        # NVML pre-flight: read driver-side free VRAM before we take the file
-        # lock so the transact closure stays fast. Raises if pynvml is
-        # unavailable and a GPU is requested (intentional hard fail).
+        # NVML / statvfs pre-flight: read driver-side free VRAM and actual
+        # free disk before we take the file lock so the transact closure
+        # stays fast. Raises if pynvml is unavailable and a GPU is requested
+        # (intentional hard fail), or a disk mount path can't be statted.
         nvml_free = _read_nvml_for_request(num_gpus)
+        disk_free = _read_disk_free_for_request(non_gpu_resources)
 
         result: list[LeaseHandle] = []
 
@@ -674,6 +753,7 @@ class ResourcePool:
                 num_gpus=num_gpus,
                 non_gpu=non_gpu_resources,
                 nvml_free=nvml_free,
+                disk_free=disk_free,
             )
             if resolved is None:
                 # Either internal accounting is short, or NVML is short on
@@ -841,9 +921,13 @@ class ResourcePool:
         non_gpu = dict(own_entry_snapshot.resources)
         label = own_entry_snapshot.label
 
-        # NVML pre-flight: read driver-side free VRAM before we take the file
-        # lock. Raises if pynvml is unavailable and a GPU is requested.
+        # NVML / statvfs pre-flight: read driver-side free VRAM and actual
+        # free disk before we take the file lock. Raises if pynvml is
+        # unavailable and a GPU is requested, or a disk path can't be
+        # statted. Re-read every poll tick — external writes move the disk
+        # ground truth just like external processes move NVML's.
         nvml_free = _read_nvml_for_request(num_gpus)
+        disk_free = _read_disk_free_for_request(non_gpu)
         nvml_for_gate: dict[str, int] | None = nvml_free
         nvml_gate_unreachable = False
 
@@ -891,6 +975,7 @@ class ResourcePool:
                     num_gpus=entry.num_gpus,
                     non_gpu=entry.resources,
                     nvml_free=gate_nvml,
+                    disk_free=_gate_disk_free(entry.resources),
                 )
                 if cand_resolved is None:
                     continue
@@ -904,6 +989,7 @@ class ResourcePool:
                 num_gpus=num_gpus,
                 non_gpu=non_gpu,
                 nvml_free=nvml_free,
+                disk_free=disk_free,
             )
 
             if resolved is not None:
@@ -940,6 +1026,7 @@ class ResourcePool:
                 num_gpus=num_gpus,
                 non_gpu=non_gpu,
                 nvml_free=nvml_free,
+                disk_free=disk_free,
             )
 
         transact(self._path, _promote)
@@ -959,6 +1046,7 @@ def _request_reclaim_to_resolve(
     num_gpus: int,
     non_gpu: dict[str, int],
     nvml_free: dict[str, int] | None,
+    disk_free: dict[str, int] | None = None,
 ) -> None:
     """Walk *relevant* reclaimable leases in priority order; mark each for
     reclaim until the request becomes resolvable.
@@ -992,7 +1080,12 @@ def _request_reclaim_to_resolve(
     mark reclaim when the union of evictions fully covers.
     """
     relevant_keys = _shortfall_keys(
-        state, vram_mb_each=vram_mb_each, num_gpus=num_gpus, non_gpu=non_gpu, nvml_free=nvml_free
+        state,
+        vram_mb_each=vram_mb_each,
+        num_gpus=num_gpus,
+        non_gpu=non_gpu,
+        nvml_free=nvml_free,
+        disk_free=disk_free,
     )
     if not relevant_keys:
         return
@@ -1024,6 +1117,7 @@ def _request_reclaim_to_resolve(
                 num_gpus=num_gpus,
                 non_gpu=non_gpu,
                 nvml_free=nvml_free,
+                disk_free=disk_free,
             )
             is not None
         )
@@ -1053,18 +1147,26 @@ def _shortfall_keys(
     num_gpus: int,
     non_gpu: dict[str, int],
     nvml_free: dict[str, int] | None,
+    disk_free: dict[str, int] | None = None,
 ) -> set[str]:
     """Resource keys whose lease holders could plausibly help close the gap.
 
     Combines internal-accounting deficits with NVML drift on GPUs the
     scheduler would otherwise consider eligible. Used to keep the reclaim
     cascade from evicting leases on unrelated GPUs / non-GPU resources when
-    the actual shortfall is elsewhere.
+    the actual shortfall is elsewhere. Disk keys use the free-space check
+    (``request > actual_free - leased``) — evicting another disk reclaimable
+    frees its *reservation*, which can admit us even though it deletes no
+    bytes.
     """
     keys: set[str] = set()
     avail = state.available()
+    used = state.used_per_key()
     for key, val in non_gpu.items():
-        if val > avail.get(key, 0):
+        if parse_disk_mb_key(key) is not None:
+            if val > (disk_free or {}).get(key, 0) - used.get(key, 0):
+                keys.add(key)
+        elif val > avail.get(key, 0):
             keys.add(key)
     if num_gpus > 0 and vram_mb_each is not None:
         per_gpu = state.per_gpu_free()

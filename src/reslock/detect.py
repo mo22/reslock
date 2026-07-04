@@ -26,6 +26,43 @@ Same NUMA reservation as ``CPU_CORES_KEY``: ``ram_mb@node<N>`` in v2.
 """
 
 
+DISK_MB_PREFIX = "disk_mb@"
+"""Prefix for free-disk-space lease keys: ``disk_mb@<mount-path>``.
+
+Disk leases have *free-space admission* semantics, not capacity semantics:
+no registration needed — at acquire time the scheduler stats the mount and
+grants only while ``sum(active disk leases) + request <= actual free``.
+The lease reserves headroom for bytes about to be written (a download, a
+conversion scratch dir); the consumer writes them and releases. Written
+bytes then show up in the statvfs ground truth, so persistent storage is
+accounted for automatically without a long-lived lease.
+"""
+
+
+def disk_mb_key(path: str) -> str:
+    """Build the free-disk-space lease key for a mount path (``disk_mb@<path>``)."""
+    return f"{DISK_MB_PREFIX}{os.path.normpath(path)}"
+
+
+def parse_disk_mb_key(key: str) -> str | None:
+    """Extract the mount path from a ``disk_mb@<path>`` key, or None if not a disk key."""
+    if key.startswith(DISK_MB_PREFIX):
+        return key[len(DISK_MB_PREFIX) :]
+    return None
+
+
+def get_disk_free_mb(path: str) -> int | None:
+    """Actual free disk space on the filesystem holding *path*, in MB.
+
+    Ground truth for disk-lease admission (statvfs). Returns None if the
+    path cannot be statted.
+    """
+    try:
+        return shutil.disk_usage(path).free // (1024 * 1024)
+    except OSError:
+        return None
+
+
 def gpu_vram_key(gpu_uuid: str) -> str:
     """Build the reslock resource key for a GPU UUID's VRAM."""
     return f"gpu_{gpu_uuid}_vram_mb"

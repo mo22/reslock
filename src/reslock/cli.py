@@ -16,10 +16,13 @@ from rich.console import Console
 from rich.table import Table
 
 from reslock.detect import (
+    disk_mb_key,
     get_all_pid_vram_mb,
     get_all_pid_vram_per_gpu_mb,
+    get_disk_free_mb,
     get_pid_cpu_seconds,
     get_pid_rss_mb,
+    parse_disk_mb_key,
     parse_gpu_vram_key,
 )
 from reslock.models import QueueEntry, State
@@ -140,6 +143,31 @@ def status(state: Path | None, short: bool) -> None:
         console.print(
             "[dim]No resources configured. Use pool.set_resources() or 'reslock set'.[/dim]"
         )
+
+    # Disk leases have free-space admission semantics (no registered
+    # capacity), so they get their own view: live statvfs vs. reserved.
+    disk_keys = sorted(
+        {k for lease in st.leases for k in lease.resources if parse_disk_mb_key(k)}
+        | {k for e in st.queue for k in e.resources if parse_disk_mb_key(k)}
+    )
+    if disk_keys:
+        used_per_key: dict[str, int] = {}
+        for lease in st.leases:
+            for key, val in lease.resources.items():
+                used_per_key[key] = used_per_key.get(key, 0) + val
+        table = Table(title="Disk (free-space leases)")
+        table.add_column("Mount", style="cyan")
+        table.add_column("Actual free", justify="right")
+        table.add_column("Leased", justify="right")
+        table.add_column("Headroom", justify="right")
+        for key in disk_keys:
+            mount = parse_disk_mb_key(key) or "?"
+            free = get_disk_free_mb(mount)
+            leased = used_per_key.get(key, 0)
+            free_str = str(free) if free is not None else "?"
+            headroom = str(free - leased) if free is not None else "?"
+            table.add_row(mount, free_str, str(leased), headroom)
+        console.print(table)
 
     if st.leases:
         table = Table(title=f"Leases ({len(st.leases)} active)")
@@ -516,6 +544,14 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
 )
 @click.option("--ram", default=None, help="RAM to reserve (e.g., 16G)")
 @click.option("--cpu", type=int, default=None, help="CPU cores to reserve")
+@click.option(
+    "--disk",
+    default=None,
+    help="Free disk space to reserve (e.g., 16G); admission is against live statvfs",
+)
+@click.option(
+    "--disk-path", default="/", help="Mount path for --disk (default: /)", show_default=True
+)
 @click.option("--priority", "-p", type=int, default=0, help="Priority (higher = more urgent)")
 @click.option("--label", "-l", default=None, help="Label for this lease")
 @click.option(
@@ -539,6 +575,8 @@ def run(
     num_gpus: int,
     ram: str | None,
     cpu: int | None,
+    disk: str | None,
+    disk_path: str,
     priority: int,
     label: str | None,
     reclaimable: bool,
@@ -567,10 +605,12 @@ def run(
         non_gpu["ram_mb"] = _parse_size(ram)
     if cpu:
         non_gpu["cpu_cores"] = cpu
+    if disk:
+        non_gpu[disk_mb_key(disk_path)] = _parse_size(disk)
 
     if num_gpus == 0 and not non_gpu:
         raise click.UsageError(
-            "Specify at least one resource (--vram-mb-each + --num-gpus, --ram, --cpu)"
+            "Specify at least one resource (--vram-mb-each + --num-gpus, --ram, --cpu, --disk)"
         )
 
     sig = getattr(signal, reclaim_signal, None)

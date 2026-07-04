@@ -133,6 +133,23 @@ The keys are host-global counters — no NUMA awareness yet. The naming is
 NUMA-open by design: a future version can add per-node capacities like
 `cpu_cores@node0` alongside the global keys without a schema change.
 
+### Disk: lease transient usage, only report persistent usage
+
+Disk capacity registers per mount via `detect_disk_mb(["/", "/data"])`
+(keys `disk_root_mb`, `disk_data_mb`, ...). Whether to *lease* disk depends
+on the usage shape:
+
+- **Transient usage** (scratch space for a conversion job, an in-flight
+  download) is lease-shaped: acquire it as an ordinary counter,
+  `pool.acquire(disk_data_mb=500_000)`, and it's freed on release — or
+  incrementally via `lease.shrink(disk_data_mb=...)` as the job cleans up.
+- **Persistent artifacts** (model weights that outlive the process) are
+  deliberately **not** leasable. Lease cleanup is PID-based — when the owning
+  process exits, the lease is dropped while the bytes remain, so a "storage
+  lease" would drift from reality immediately. Track persistent usage with
+  capacity reporting and consumer-side eviction policy instead (same
+  philosophy as `gpu_orphans()`: reslock diagnoses, consumers decide).
+
 ## CLI
 
 ```bash

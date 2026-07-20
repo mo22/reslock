@@ -29,6 +29,7 @@ from reslock.models import Lease, PoolStatus, QueueEntry, State
 from reslock.nvml import (
     NvmlUnavailableError,
     nvml_free_vram_mb,
+    nvml_total_vram_mb,
 )
 from reslock.state import (
     DEFAULT_STATE_PATH,
@@ -806,17 +807,77 @@ class ResourcePool:
         left unchanged (so multiple consumers can register different resource
         types independently).
 
+        Capacity means the *physical total* of the resource — for GPU VRAM
+        keys, the card's ``memory.total`` as reported by NVML. External or
+        transient VRAM usage is already handled by the NVML pre-flight at
+        placement time, so consumers must NOT write derived free-based
+        snapshots here: they go stale the moment the VRAM frees and can block
+        promotion on a physically idle host. Registering less than total is
+        legitimate only as a deliberate, static headroom reserve (cf.
+        ``detect_ram_mb(reserve_mb=...)``); a GPU value below the NVML
+        physical total logs a warning either way.
+
         Args:
             resources: Mapping of resource name to total capacity,
                 e.g. ``{"gpu_GPU-1a2b3c4d-..._vram_mb": 24000, "cpu_cores": 16}``.
                 GPU capacities still use UUID-keyed entries — the v3
                 request-shape change only affects ``acquire()`` callers.
         """
+        self._warn_gpu_capacity_mismatch(resources)
 
         def _set(state: State) -> None:
             state.resources.update(resources)
 
         transact(self._path, _set)
+
+    @staticmethod
+    def _warn_gpu_capacity_mismatch(resources: dict[str, int]) -> None:
+        """Warn when a submitted GPU VRAM capacity differs from the NVML total.
+
+        Tripwire for the 2026-07-20 kirk incident: a consumer persisted
+        free-based snapshots as capacity via ``set_resources``, which went
+        stale and blocked promotion on an idle host. Log-only — the value is
+        registered regardless. Fails soft when NVML is unavailable;
+        ``nvml_total_vram_mb`` caches totals per process, so frequent
+        re-registration doesn't hammer the driver.
+        """
+        gpu_keys = {k: u for k in resources if (u := parse_gpu_vram_key(k)) is not None}
+        if not gpu_keys:
+            return
+        try:
+            totals = nvml_total_vram_mb()
+        except NvmlUnavailableError:
+            return
+        except Exception:
+            logger.debug("reslock: NVML total lookup failed in set_resources", exc_info=True)
+            return
+        for key, uuid_str in gpu_keys.items():
+            total = totals.get(uuid_str)
+            if total is None:
+                continue
+            value = resources[key]
+            if value < total:
+                logger.warning(
+                    "reslock: set_resources registering %s=%d MB, below the NVML physical "
+                    "total of %d MB (caller pid %d). Capacity must be the physical total — "
+                    "transient VRAM usage is handled by the NVML pre-flight at placement "
+                    "time. Do not register derived free-based values; a stale snapshot "
+                    "blocks promotion on an idle host.",
+                    key,
+                    value,
+                    total,
+                    os.getpid(),
+                )
+            elif value > total:
+                logger.warning(
+                    "reslock: set_resources registering %s=%d MB, above the NVML physical "
+                    "total of %d MB (caller pid %d). Leases granted against phantom "
+                    "capacity will fail the NVML pre-flight at placement time.",
+                    key,
+                    value,
+                    total,
+                    os.getpid(),
+                )
 
     def status(self) -> PoolStatus:
         state = read_state_clean(self._path)

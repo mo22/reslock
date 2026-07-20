@@ -33,6 +33,7 @@ _pynvml: Any = None
 _initialized = False
 _free_cache: dict[str, int] = {}
 _free_cache_at: float = 0.0
+_total_cache: dict[str, int] | None = None
 
 
 class NvmlUnavailableError(RuntimeError):
@@ -107,6 +108,33 @@ def nvml_free_vram_mb(cache_seconds: float = 1.0) -> dict[str, int]:
     return dict(out)
 
 
+def nvml_total_vram_mb() -> dict[str, int]:
+    """Read total (physical) VRAM per GPU UUID from the NVIDIA driver.
+
+    Returns ``{gpu_uuid: total_mb}`` for every visible GPU. Physical totals
+    don't change while a process runs, so the result is cached for the
+    process lifetime — repeat callers (e.g. a consumer re-registering
+    capacities every few seconds) never touch the driver again.
+
+    Raises ``NvmlUnavailableError`` if pynvml is missing or ``nvmlInit()``
+    fails.
+    """
+    global _total_cache
+    if _total_cache is not None:
+        return dict(_total_cache)
+    m = _ensure_initialized()
+    out: dict[str, int] = {}
+    count = int(m.nvmlDeviceGetCount())
+    for i in range(count):
+        handle = m.nvmlDeviceGetHandleByIndex(i)
+        uuid_raw = m.nvmlDeviceGetUUID(handle)
+        uuid_str = uuid_raw.decode() if isinstance(uuid_raw, bytes) else str(uuid_raw)
+        mem = m.nvmlDeviceGetMemoryInfo(handle)
+        out[uuid_str] = int(mem.total) // (1024 * 1024)
+    _total_cache = out
+    return dict(out)
+
+
 def compute_nvml_shortfall(resources: dict[str, int], nvml_free: dict[str, int]) -> dict[str, int]:
     """Per-key shortfall: how much more VRAM the request needs beyond NVML free.
 
@@ -131,9 +159,10 @@ def compute_nvml_shortfall(resources: dict[str, int], nvml_free: dict[str, int])
 
 def reset_for_test() -> None:
     """Reset module-level cache and init flags. Tests only."""
-    global _initialized, _free_cache, _free_cache_at, _pynvml
+    global _initialized, _free_cache, _free_cache_at, _pynvml, _total_cache
     with _lock:
         _initialized = False
         _free_cache = {}
         _free_cache_at = 0.0
         _pynvml = None
+        _total_cache = None

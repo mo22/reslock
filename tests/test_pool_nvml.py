@@ -119,6 +119,21 @@ def test_try_acquire_refuses_when_nvml_short_despite_internal_fit(
     assert h is None
 
 
+def test_per_slot_try_acquire_refuses_when_nvml_breaks_pairing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Internal capacities fit, but NVML leaves no card for the largest slot."""
+    monkeypatch.setitem(
+        sys.modules,
+        "pynvml",
+        _fake_pynvml([(UUID_A, 24000, 18000), (UUID_B, 20000, 20000)]),
+    )
+    pool = ResourcePool(tmp_path / "state.json")
+    pool.set_resources({gpu_vram_key(UUID_A): 24000, gpu_vram_key(UUID_B): 20000})
+
+    assert pool.try_acquire(vram_mb=[22000, 19000]) is None
+
+
 def test_try_acquire_raises_when_pynvml_missing_for_gpu_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

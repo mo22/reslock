@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from reslock.detect import gpu_vram_key, parse_disk_mb_key, parse_gpu_vram_key
 
@@ -14,6 +14,38 @@ def _utcnow() -> datetime:
 
 def _new_id() -> str:
     return uuid4().hex[:12]
+
+
+def normalize_gpu_asks(
+    *, vram_mb: list[int] | None, vram_mb_each: int | None, num_gpus: int
+) -> list[int]:
+    """Validate the two GPU request shapes and return asks largest-first."""
+    if num_gpus < 0:
+        raise ValueError(f"num_gpus must be non-negative, got {num_gpus}")
+    if vram_mb is not None:
+        if vram_mb_each is not None or num_gpus != 0:
+            raise ValueError(
+                "vram_mb is mutually exclusive with vram_mb_each and num_gpus "
+                f"(got vram_mb_each={vram_mb_each!r}, num_gpus={num_gpus})"
+            )
+        if not vram_mb:
+            raise ValueError("vram_mb must contain at least one per-slot request")
+        if any(amount <= 0 for amount in vram_mb):
+            raise ValueError(f"vram_mb values must be positive ints, got {vram_mb!r}")
+        return sorted(vram_mb, reverse=True)
+    if num_gpus > 0 and (vram_mb_each is None or vram_mb_each <= 0):
+        raise ValueError(
+            "vram_mb_each must be a positive int when num_gpus > 0 "
+            f"(got vram_mb_each={vram_mb_each!r}, num_gpus={num_gpus})"
+        )
+    if num_gpus == 0 and vram_mb_each is not None:
+        raise ValueError(
+            f"vram_mb_each={vram_mb_each!r} requires num_gpus > 0; "
+            "set num_gpus to a positive number or drop vram_mb_each"
+        )
+    if vram_mb_each is None:
+        return []
+    return [vram_mb_each] * num_gpus
 
 
 class Lease(BaseModel):
@@ -77,6 +109,7 @@ class QueueEntry(BaseModel):
     host_pid: int | None = None
 
     resources: dict[str, int] = Field(default_factory=dict)
+    vram_mb: list[int] | None = None
     vram_mb_each: int | None = None
     num_gpus: int = 0
     reclaimable_intent: bool = False
@@ -93,14 +126,32 @@ class QueueEntry(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    @model_validator(mode="after")
+    def _validate_gpu_request(self) -> QueueEntry:
+        normalize_gpu_asks(
+            vram_mb=self.vram_mb,
+            vram_mb_each=self.vram_mb_each,
+            num_gpus=self.num_gpus,
+        )
+        return self
+
     @property
     def is_active(self) -> bool:
         """True when the entry has been promoted (or attached) to a Lease."""
         return self.lease_id is not None
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """Current state-file schema version.
+
+Version 4 (v0.11.0):
+
+* ``QueueEntry`` gained ``vram_mb`` for non-uniform per-slot GPU VRAM asks.
+  The existing ``vram_mb_each`` + ``num_gpus`` request shape remains valid.
+* GPU requests are paired largest-first with GPUs sorted by effective free
+  VRAM descending. The two request shapes are mutually exclusive.
+* Mixed-version operation is unsafe: stop all consumers sharing the state
+  file, delete ``state.json``, and restart them on v0.11.0 or newer.
 
 Version 3 (v0.8.0):
 
@@ -162,6 +213,7 @@ class State(BaseModel):
     def try_resolve_request(
         self,
         *,
+        vram_mb: list[int] | None = None,
         vram_mb_each: int | None,
         num_gpus: int,
         non_gpu: dict[str, int],
@@ -171,6 +223,8 @@ class State(BaseModel):
         """Resolve an abstract resource request into a concrete bindings dict.
 
         Args:
+            vram_mb: Non-uniform per-slot GPU VRAM asks. Mutually exclusive
+                with ``vram_mb_each`` and ``num_gpus``.
             vram_mb_each: Per-GPU VRAM ask. Required when ``num_gpus > 0``.
                 Setting this when ``num_gpus == 0`` is a programming error and
                 raises — silently dropping the VRAM ask would let
@@ -197,29 +251,19 @@ class State(BaseModel):
             with ``gpu_<uuid>_vram_mb`` keys filled in for the chosen GPUs —
             or ``None`` if the request can't currently be satisfied.
 
-        Placement policy: GPUs are sorted by effective free VRAM **descending**
-        (ties broken by UUID), and the first ``num_gpus`` whose free ≥
-        ``vram_mb_each`` are picked. This spreads multi-GPU work across the
-        emptiest cards, matching the access pattern of multi-GPU inference
-        (NCCL / tensor parallel) where you want disjoint cards with similar
-        headroom. Folding NVML into placement (instead of resolving first and
-        cross-checking the picked set afterward) lets the scheduler skip an
-        NVML-short GPU and pick a different qualifying one — without it, an
-        any-1-GPU request could be refused even when an alternative GPU has
-        both internal headroom and NVML headroom.
+        Placement policy: asks are sorted descending, GPUs are sorted by
+        effective free VRAM descending (ties broken by UUID), and the two
+        lists are paired. If any ask exceeds its paired GPU's free VRAM, no
+        assignment exists. This spreads multi-GPU work across the emptiest
+        cards, matching the access pattern of multi-GPU inference (NCCL /
+        tensor parallel). Folding NVML into placement lets the scheduler skip
+        an internally-free GPU held by an external process.
         """
-        if num_gpus < 0:
-            raise ValueError(f"num_gpus must be non-negative, got {num_gpus}")
-        if num_gpus > 0 and (vram_mb_each is None or vram_mb_each <= 0):
-            raise ValueError(
-                "vram_mb_each must be a positive int when num_gpus > 0 "
-                f"(got vram_mb_each={vram_mb_each!r}, num_gpus={num_gpus})"
-            )
-        if num_gpus == 0 and vram_mb_each is not None:
-            raise ValueError(
-                f"vram_mb_each={vram_mb_each!r} requires num_gpus > 0; "
-                "set num_gpus to a positive number or drop vram_mb_each"
-            )
+        gpu_asks = normalize_gpu_asks(
+            vram_mb=vram_mb,
+            vram_mb_each=vram_mb_each,
+            num_gpus=num_gpus,
+        )
 
         avail_non_gpu = self.available()
         used = self.used_per_key()
@@ -237,25 +281,20 @@ class State(BaseModel):
 
         bindings: dict[str, int] = dict(non_gpu)
 
-        if num_gpus == 0:
+        if not gpu_asks:
             return bindings
 
-        assert vram_mb_each is not None  # checked above
         per_gpu = self.per_gpu_free()
         if nvml_free is not None:
             per_gpu = {u: min(free, nvml_free.get(u, 0)) for u, free in per_gpu.items()}
         # Sort by free desc, ties broken by UUID asc for determinism.
         candidates = sorted(per_gpu.items(), key=lambda item: (-item[1], item[0]))
-        picked: list[str] = []
-        for uuid_str, free in candidates:
-            if free >= vram_mb_each:
-                picked.append(uuid_str)
-                if len(picked) == num_gpus:
-                    break
-        if len(picked) < num_gpus:
+        if len(candidates) < len(gpu_asks):
             return None
-        for uuid_str in picked:
-            bindings[gpu_vram_key(uuid_str)] = vram_mb_each
+        for ask, (uuid_str, free) in zip(gpu_asks, candidates[: len(gpu_asks)], strict=True):
+            if free < ask:
+                return None
+            bindings[gpu_vram_key(uuid_str)] = ask
         return bindings
 
     def can_fit(self, resources: dict[str, int]) -> bool:

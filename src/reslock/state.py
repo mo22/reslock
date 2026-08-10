@@ -24,8 +24,9 @@ def _load_state(data: str) -> State:
     Any non-current ``version`` triggers a reset: ``resources``, ``leases``,
     and ``queue`` are dropped so the next ``set_resources()`` / ``acquire()``
     repopulates under the current schema. This is how the v0.5.0 (v1→v2) and
-    v0.8.0 (v2→v3) schema bumps were rolled out — coordinated upgrade across
-    consumers, state file resets on first read by a new-version process.
+    v0.8.0 (v2→v3) and v0.11.0 (v3→v4) schema bumps were rolled out —
+    coordinated upgrade across consumers, state file resets on first read by
+    a new-version process.
     Dead PID cleanup handles stale process entries separately.
 
     The version is peeked from the raw JSON before strict Pydantic validation,

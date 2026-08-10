@@ -168,3 +168,57 @@ def test_resolve_request_picks_correct_count(tmp_path: Path) -> None:
     assert h is not None
     assert len(h.gpu_uuids) == 2
     h.release()
+
+
+def test_per_slot_request_avoids_uniform_max_rounding(tmp_path: Path) -> None:
+    """An asymmetric ask fits even though ``max(asks) * len(asks)`` would not.
+
+    GPU A can hold the 22 MB slot and GPU B can hold the 19 MB slot. The old
+    caller-side rounding to ``vram_mb_each=22, num_gpus=2`` would reject B.
+    """
+    pool = _make_pool(
+        tmp_path,
+        **{
+            gpu_vram_key(UUID_A): 22,
+            gpu_vram_key(UUID_B): 19,
+        },
+    )
+
+    h = pool.try_acquire(vram_mb=[19, 22], estimated_seconds=30)
+
+    assert h is not None
+    assert h.resources == {
+        gpu_vram_key(UUID_A): 22,
+        gpu_vram_key(UUID_B): 19,
+    }
+    assert h.entry is not None
+    assert pool.status().queue[0].vram_mb == [19, 22]
+    h.release()
+
+
+def test_per_slot_request_rejects_when_largest_slot_has_no_card(tmp_path: Path) -> None:
+    """Enough aggregate VRAM is not enough when the 22 MB slot has no home."""
+    pool = _make_pool(
+        tmp_path,
+        **{
+            gpu_vram_key(UUID_A): 21,
+            gpu_vram_key(UUID_B): 20,
+        },
+    )
+
+    assert pool.try_acquire(vram_mb=[22, 19]) is None
+
+
+def test_per_slot_request_rejects_invalid_or_mixed_shapes(tmp_path: Path) -> None:
+    """Never silently drop an empty/invalid slot ask or combine both GPU APIs."""
+    pool = _make_pool(tmp_path, **{gpu_vram_key(UUID_A): 24})
+
+    invalid_calls = (
+        lambda: pool.try_acquire(vram_mb=[]),
+        lambda: pool.try_acquire(vram_mb=[0]),
+        lambda: pool.try_acquire(vram_mb=[8], vram_mb_each=8, num_gpus=1),
+        lambda: pool.try_acquire(vram_mb=[8], num_gpus=1),
+    )
+    for call in invalid_calls:
+        with pytest.raises(ValueError):
+            call()

@@ -112,6 +112,14 @@ def _shorten_resource_key(key: str) -> str:
     return f"gpu_…{uuid_str[-8:]}_vram_mb"
 
 
+def _fmt_gpu_request(entry: QueueEntry) -> str | None:
+    if entry.vram_mb is not None:
+        return f"{'+'.join(str(amount) for amount in entry.vram_mb)}MB GPU"
+    if entry.num_gpus > 0 and entry.vram_mb_each is not None:
+        return f"{entry.num_gpus}x{entry.vram_mb_each}MB GPU"
+    return None
+
+
 @main.command()
 @click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
 @click.option("--short", is_flag=True, help="Abbreviate GPU UUIDs to the last 8 chars")
@@ -207,8 +215,9 @@ def status(state: Path | None, short: bool) -> None:
 
         def _fmt_request(e: QueueEntry) -> str:
             parts: list[str] = []
-            if e.num_gpus > 0 and e.vram_mb_each is not None:
-                parts.append(f"{e.num_gpus}x{e.vram_mb_each}MB GPU")
+            gpu_request = _fmt_gpu_request(e)
+            if gpu_request is not None:
+                parts.append(gpu_request)
             if e.resources:
                 parts.append(_fmt_resources(e.resources))
             return ", ".join(parts) or "-"
@@ -235,6 +244,7 @@ def status(state: Path | None, short: bool) -> None:
             table.add_column("ID", style="cyan")
             table.add_column("PID")
             table.add_column("Lease")
+            table.add_column("Request")
             table.add_column("ETA")
             table.add_column("Progress", justify="right")
             table.add_column("Label")
@@ -245,6 +255,7 @@ def status(state: Path | None, short: bool) -> None:
                     e.id,
                     str(e.pid),
                     e.lease_id or "-",
+                    _fmt_request(e),
                     eta,
                     progress,
                     e.label or "",
@@ -512,8 +523,9 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
             grid.add_section()
             for e in waiting:
                 parts: list[str] = []
-                if e.num_gpus > 0 and e.vram_mb_each is not None:
-                    parts.append(f"{e.num_gpus}x{e.vram_mb_each}MB GPU")
+                gpu_request = _fmt_gpu_request(e)
+                if gpu_request is not None:
+                    parts.append(gpu_request)
                 if e.resources:
                     parts.append(", ".join(f"{k}={v}" for k, v in e.resources.items()))
                 req = ", ".join(parts) or "-"
@@ -534,6 +546,11 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
 
 
 @main.command()
+@click.option(
+    "--vram",
+    multiple=True,
+    help="Per-slot GPU VRAM to reserve; repeat for each slot (e.g. --vram 22G --vram 19G).",
+)
 @click.option(
     "--vram-mb-each",
     default=None,
@@ -571,6 +588,7 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
 @click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
 @click.argument("command", nargs=-1, required=True)
 def run(
+    vram: tuple[str, ...],
     vram_mb_each: str | None,
     num_gpus: int,
     ram: str | None,
@@ -587,14 +605,17 @@ def run(
 ) -> None:
     """Reserve resources and run a command.
 
-    GPU placement: if --num-gpus > 0, the scheduler picks --num-gpus GPUs
-    with the most free VRAM at promotion time (spread placement). Use
-    --reclaimable to allow eviction by higher-priority requests; on reclaim
-    the specified signal is sent to the child process.
+    GPU placement pairs repeated --vram slot asks largest-first with GPUs
+    having the most free VRAM. The uniform --vram-mb-each + --num-gpus form
+    remains available. Use --reclaimable to allow eviction by higher-priority
+    requests; on reclaim the specified signal is sent to the child process.
     """
+    vram_mb = [_parse_size(value) for value in vram] or None
     vram_each_mb: int | None = None
     if vram_mb_each is not None:
         vram_each_mb = _parse_size(vram_mb_each)
+    if vram_mb is not None and (vram_each_mb is not None or num_gpus != 0):
+        raise click.UsageError("--vram is mutually exclusive with --vram-mb-each and --num-gpus")
     if num_gpus > 0 and vram_each_mb is None:
         raise click.UsageError("--vram-mb-each is required when --num-gpus > 0")
     if vram_each_mb is not None and num_gpus == 0:
@@ -608,9 +629,10 @@ def run(
     if disk:
         non_gpu[disk_mb_key(disk_path)] = _parse_size(disk)
 
-    if num_gpus == 0 and not non_gpu:
+    if vram_mb is None and num_gpus == 0 and not non_gpu:
         raise click.UsageError(
-            "Specify at least one resource (--vram-mb-each + --num-gpus, --ram, --cpu, --disk)"
+            "Specify at least one resource (--vram, --vram-mb-each + --num-gpus, "
+            "--ram, --cpu, --disk)"
         )
 
     sig = getattr(signal, reclaim_signal, None)
@@ -622,12 +644,15 @@ def run(
     pool = ResourcePool(path)
 
     parts: list[str] = []
-    if num_gpus > 0:
+    if vram_mb is not None:
+        parts.append(f"{'+'.join(str(amount) for amount in vram_mb)}MB GPU")
+    elif num_gpus > 0:
         parts.append(f"{num_gpus}x{vram_each_mb}MB GPU")
     if non_gpu:
         parts.extend(f"{k}={v}" for k, v in non_gpu.items())
     console.print(f"[dim]Waiting for resources: {', '.join(parts)}...[/dim]")
     with pool.acquire(
+        vram_mb=vram_mb,
         vram_mb_each=vram_each_mb,
         num_gpus=num_gpus,
         priority=priority,

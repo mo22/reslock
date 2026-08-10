@@ -99,6 +99,22 @@ def test_old_v2_schema_is_reset_on_read(tmp_path: Path) -> None:
     assert state.queue == []
 
 
+def test_old_v3_schema_is_reset_before_per_slot_queue_validation(tmp_path: Path) -> None:
+    """v4 must reset a v3 state before strictly validating QueueEntry fields."""
+    path = tmp_path / "state.json"
+    path.write_text(
+        '{"version": 3, "resources": {"gpu_GPU-abc_vram_mb": 24000}, '
+        '"leases": [], "queue": [{"pid": 123, "vram_mb_each": 8000, "num_gpus": 1}]}'
+    )
+
+    state = read_state(path)
+
+    assert state.version == 4
+    assert state.resources == {}
+    assert state.leases == []
+    assert state.queue == []
+
+
 def test_old_schema_reset_persisted_on_transact(tmp_path: Path) -> None:
     """After transact() on a v1 file, the file is rewritten at the current schema."""
     path = tmp_path / "state.json"

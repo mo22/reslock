@@ -77,14 +77,35 @@ pool.set_resources(detect_gpu_vram_mb())
 
 GPU VRAM resources are keyed by the host-stable **GPU UUID** (as reported by `nvidia-smi` or `torch.cuda.get_device_properties(i).uuid`), not the nvidia-smi index. This keeps coordination correct across containers that get partial GPU mappings from the NVIDIA container runtime — each container sees only its mapped cards renumbered from 0, but UUIDs are invariant.
 
-Consumers that hold a local torch device index should build the resource key via `gpu_resource_key(torch_index)`:
+GPU acquire requests are abstract; the scheduler selects UUIDs when the lease
+is promoted. Use the uniform form for equal requirements:
+
+```python
+with pool.acquire(vram_mb_each=22_860, num_gpus=4) as lease:
+    run_model(lease.gpu_uuids)
+```
+
+For asymmetric requirements, pass one VRAM amount per slot. Requirements and
+available GPUs are sorted largest-first and paired, so a smaller slot does not
+get rounded up to the largest requirement:
+
+```python
+with pool.acquire(vram_mb=[22_860, 22_860, 19_000]) as lease:
+    run_model(lease.gpu_uuids)
+```
+
+The two request forms are mutually exclusive. A single integer
+`vram_mb=4000` retains its historical meaning as a free-form counter named
+`vram_mb`; only a list selects per-slot GPU scheduling.
+
+Consumers that hold a local torch device index can build its UUID resource key
+for capacity registration via `gpu_resource_key(torch_index)`:
 
 ```python
 from reslock import gpu_resource_key
 
 key = gpu_resource_key(0)  # → "gpu_GPU-1a2b3c4d-..._vram_mb"
-with pool.acquire(**{key: 4000}):
-    run_model()
+pool.set_resources({key: 24_576})
 ```
 
 Multiple consumers can register different resource types independently — keys that aren't mentioned are left unchanged. This means an AI server can register GPU VRAM while a separate build system registers CPU cores, and they share the same state file.
@@ -175,9 +196,9 @@ reslock set cpu_cores 16
 reslock status
 reslock status --short   # abbreviate GPU UUIDs to last 8 chars
 
-# Run a command with reserved resources — indexes are resolved to UUIDs
-reslock run --vram 4G llama-cli --model model.gguf
-reslock run --gpu-vram 0:4G --gpu-vram 1:8G python train.py
+# Run a command with reserved resources — the scheduler selects UUIDs
+reslock run --vram-mb-each 4G --num-gpus 1 llama-cli --model model.gguf
+reslock run --vram 8G --vram 6G python train.py
 reslock run --vram 8G --priority 10 --label "llama-70b" llama-cli ...
 reslock run --vram 4G --ram 16G --cpu 4 python train.py
 

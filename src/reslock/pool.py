@@ -25,7 +25,7 @@ from reslock.detect import (
 
 if TYPE_CHECKING:
     from reslock.audit import OrphanReport
-from reslock.models import Lease, PoolStatus, QueueEntry, State
+from reslock.models import Lease, PoolStatus, QueueEntry, State, normalize_gpu_asks
 from reslock.nvml import (
     NvmlUnavailableError,
     nvml_free_vram_mb,
@@ -100,19 +100,35 @@ def _gate_disk_free(non_gpu: dict[str, int]) -> dict[str, int] | None:
 def _validate_non_gpu(non_gpu: dict[str, int]) -> None:
     """Reject ``gpu_<uuid>_vram_mb`` keys passed via the legacy v2 acquire shape.
 
-    v3 hard-cut: callers declare ``vram_mb_each`` + ``num_gpus`` and the
-    scheduler binds specific UUIDs at promotion time. Raising loudly here is
-    nicer than silently failing to schedule a GPU lease.
+    Since the v3 hard-cut callers use abstract asks and the scheduler binds
+    specific UUIDs at promotion time. Raising loudly here is nicer than
+    silently failing to schedule a GPU lease.
     """
     for key in non_gpu:
         if parse_gpu_vram_key(key) is not None:
             raise TypeError(
-                f"v3: GPU keys are not accepted in acquire() — got {key!r}. "
-                "Use vram_mb_each + num_gpus instead; the scheduler picks "
+                f"GPU keys are not accepted in acquire() — got {key!r}. "
+                "Use vram_mb_each + num_gpus or vram_mb=[...] instead; the scheduler picks "
                 "GPUs automatically (spread placement, most-free first). "
                 "Capacity registration via set_resources() still uses "
                 "gpu_<uuid>_vram_mb keys."
             )
+
+
+def _split_vram_mb_argument(
+    vram_mb: list[int] | int | None, non_gpu: dict[str, int]
+) -> tuple[list[int] | None, dict[str, int]]:
+    """Separate the new slot-list API from the legacy free-form counter.
+
+    Before per-slot asks existed, ``vram_mb=4000`` flowed through
+    ``**non_gpu_resources`` as an ordinary custom counter. Keep that API
+    intact: only a list selects the new abstract GPU scheduler path.
+    """
+    if isinstance(vram_mb, int):
+        merged = dict(non_gpu)
+        merged["vram_mb"] = vram_mb
+        return None, merged
+    return vram_mb, non_gpu
 
 
 def _fold_first_class(
@@ -615,6 +631,7 @@ class ResourcePool:
     def acquire(
         self,
         *,
+        vram_mb: list[int] | int | None = None,
         vram_mb_each: int | None = None,
         num_gpus: int = 0,
         cpu_cores: int | None = None,
@@ -631,6 +648,10 @@ class ResourcePool:
         """Acquire resources, blocking until granted.
 
         Args:
+            vram_mb: A list means per-slot GPU VRAM asks, mutually exclusive
+                with ``vram_mb_each`` and ``num_gpus``. The scheduler pairs
+                asks largest-first with the GPUs having the most free VRAM.
+                A single int retains the legacy free-form ``vram_mb`` counter.
             vram_mb_each: Per-GPU VRAM ask (required when ``num_gpus > 0``).
             num_gpus: Number of GPUs needed (any). The scheduler picks UUIDs
                 at promotion time using spread placement (most-free first,
@@ -663,8 +684,15 @@ class ResourcePool:
                 free-form keys. ``gpu_<uuid>_vram_mb`` keys are rejected —
                 use ``vram_mb_each`` + ``num_gpus`` instead.
         """
+        vram_slots, non_gpu_resources = _split_vram_mb_argument(vram_mb, non_gpu_resources)
         _validate_non_gpu(non_gpu_resources)
+        normalize_gpu_asks(
+            vram_mb=vram_slots,
+            vram_mb_each=vram_mb_each,
+            num_gpus=num_gpus,
+        )
         handle = self._acquire_blocking(
+            vram_mb=list(vram_slots) if vram_slots is not None else None,
             vram_mb_each=vram_mb_each,
             num_gpus=num_gpus,
             non_gpu=_fold_first_class(non_gpu_resources, cpu_cores, ram_mb, disk_mb, disk_path),
@@ -682,6 +710,7 @@ class ResourcePool:
     async def acquire_async(
         self,
         *,
+        vram_mb: list[int] | int | None = None,
         vram_mb_each: int | None = None,
         num_gpus: int = 0,
         cpu_cores: int | None = None,
@@ -696,8 +725,15 @@ class ResourcePool:
         **non_gpu_resources: int,
     ) -> LeaseHandle:
         """Async equivalent of :meth:`acquire`. Caller is responsible for ``release()``."""
+        vram_slots, non_gpu_resources = _split_vram_mb_argument(vram_mb, non_gpu_resources)
         _validate_non_gpu(non_gpu_resources)
+        normalize_gpu_asks(
+            vram_mb=vram_slots,
+            vram_mb_each=vram_mb_each,
+            num_gpus=num_gpus,
+        )
         new_entry = self._enqueue(
+            vram_mb=list(vram_slots) if vram_slots is not None else None,
             vram_mb_each=vram_mb_each,
             num_gpus=num_gpus,
             non_gpu=_fold_first_class(non_gpu_resources, cpu_cores, ram_mb, disk_mb, disk_path),
@@ -719,6 +755,7 @@ class ResourcePool:
     def try_acquire(
         self,
         *,
+        vram_mb: list[int] | int | None = None,
         vram_mb_each: int | None = None,
         num_gpus: int = 0,
         cpu_cores: int | None = None,
@@ -732,7 +769,14 @@ class ResourcePool:
         **non_gpu_resources: int,
     ) -> LeaseHandle | None:
         """Try to acquire resources without queueing. Returns ``None`` if the request can't fit."""
+        vram_slots, non_gpu_resources = _split_vram_mb_argument(vram_mb, non_gpu_resources)
         _validate_non_gpu(non_gpu_resources)
+        gpu_asks = normalize_gpu_asks(
+            vram_mb=vram_slots,
+            vram_mb_each=vram_mb_each,
+            num_gpus=num_gpus,
+        )
+        vram_slots = list(vram_slots) if vram_slots is not None else None
         non_gpu_resources = _fold_first_class(
             non_gpu_resources, cpu_cores, ram_mb, disk_mb, disk_path
         )
@@ -743,13 +787,14 @@ class ResourcePool:
         # free disk before we take the file lock so the transact closure
         # stays fast. Raises if pynvml is unavailable and a GPU is requested
         # (intentional hard fail), or a disk mount path can't be statted.
-        nvml_free = _read_nvml_for_request(num_gpus)
+        nvml_free = _read_nvml_for_request(len(gpu_asks))
         disk_free = _read_disk_free_for_request(non_gpu_resources)
 
         result: list[LeaseHandle] = []
 
         def _try(state: State) -> None:
             resolved = state.try_resolve_request(
+                vram_mb=vram_slots,
                 vram_mb_each=vram_mb_each,
                 num_gpus=num_gpus,
                 non_gpu=non_gpu_resources,
@@ -780,6 +825,7 @@ class ResourcePool:
                     pid=pid,
                     host_pid=host_pid,
                     resources=dict(non_gpu_resources),
+                    vram_mb=vram_slots,
                     vram_mb_each=vram_mb_each,
                     num_gpus=num_gpus,
                     reclaimable_intent=reclaimable,
@@ -910,6 +956,7 @@ class ResourcePool:
     def _enqueue(
         self,
         *,
+        vram_mb: list[int] | None,
         vram_mb_each: int | None,
         num_gpus: int,
         non_gpu: dict[str, int],
@@ -922,6 +969,7 @@ class ResourcePool:
             pid=os.getpid(),
             host_pid=self._host_pid,
             resources=dict(non_gpu),
+            vram_mb=vram_mb,
             vram_mb_each=vram_mb_each,
             num_gpus=num_gpus,
             reclaimable_intent=reclaimable,
@@ -939,6 +987,7 @@ class ResourcePool:
     def _acquire_blocking(
         self,
         *,
+        vram_mb: list[int] | None = None,
         vram_mb_each: int | None,
         num_gpus: int,
         non_gpu: dict[str, int],
@@ -949,6 +998,7 @@ class ResourcePool:
         poll_interval: float,
     ) -> LeaseHandle:
         new_entry = self._enqueue(
+            vram_mb=vram_mb,
             vram_mb_each=vram_mb_each,
             num_gpus=num_gpus,
             non_gpu=non_gpu,
@@ -977,6 +1027,7 @@ class ResourcePool:
         host_pid = self._host_pid
         entry_id = own_entry_snapshot.id
         priority = own_entry_snapshot.priority
+        vram_mb = own_entry_snapshot.vram_mb
         vram_mb_each = own_entry_snapshot.vram_mb_each
         num_gpus = own_entry_snapshot.num_gpus
         non_gpu = dict(own_entry_snapshot.resources)
@@ -987,7 +1038,12 @@ class ResourcePool:
         # unavailable and a GPU is requested, or a disk path can't be
         # statted. Re-read every poll tick — external writes move the disk
         # ground truth just like external processes move NVML's.
-        nvml_free = _read_nvml_for_request(num_gpus)
+        gpu_asks = normalize_gpu_asks(
+            vram_mb=vram_mb,
+            vram_mb_each=vram_mb_each,
+            num_gpus=num_gpus,
+        )
+        nvml_free = _read_nvml_for_request(len(gpu_asks))
         disk_free = _read_disk_free_for_request(non_gpu)
         nvml_for_gate: dict[str, int] | None = nvml_free
         nvml_gate_unreachable = False
@@ -1020,7 +1076,12 @@ class ResourcePool:
                 if entry.priority <= priority:
                     continue
                 gate_nvml: dict[str, int] | None = None
-                if entry.num_gpus > 0:
+                entry_gpu_asks = normalize_gpu_asks(
+                    vram_mb=entry.vram_mb,
+                    vram_mb_each=entry.vram_mb_each,
+                    num_gpus=entry.num_gpus,
+                )
+                if entry_gpu_asks:
                     if nvml_for_gate is None and not nvml_gate_unreachable:
                         try:
                             nvml_for_gate = nvml_free_vram_mb()
@@ -1032,6 +1093,7 @@ class ResourcePool:
                         return
                     gate_nvml = nvml_for_gate
                 cand_resolved = state.try_resolve_request(
+                    vram_mb=entry.vram_mb,
                     vram_mb_each=entry.vram_mb_each,
                     num_gpus=entry.num_gpus,
                     non_gpu=entry.resources,
@@ -1046,6 +1108,7 @@ class ResourcePool:
             # placement at this layer, so a returned ``resolved`` is already
             # NVML-clean.
             resolved = state.try_resolve_request(
+                vram_mb=vram_mb,
                 vram_mb_each=vram_mb_each,
                 num_gpus=num_gpus,
                 non_gpu=non_gpu,
@@ -1083,6 +1146,7 @@ class ResourcePool:
             # reclaimables whose eviction would let us resolve.
             _request_reclaim_to_resolve(
                 state,
+                vram_mb=vram_mb,
                 vram_mb_each=vram_mb_each,
                 num_gpus=num_gpus,
                 non_gpu=non_gpu,
@@ -1103,6 +1167,7 @@ class ResourcePool:
 def _request_reclaim_to_resolve(
     state: State,
     *,
+    vram_mb: list[int] | None,
     vram_mb_each: int | None,
     num_gpus: int,
     non_gpu: dict[str, int],
@@ -1142,6 +1207,7 @@ def _request_reclaim_to_resolve(
     """
     relevant_keys = _shortfall_keys(
         state,
+        vram_mb=vram_mb,
         vram_mb_each=vram_mb_each,
         num_gpus=num_gpus,
         non_gpu=non_gpu,
@@ -1174,6 +1240,7 @@ def _request_reclaim_to_resolve(
         )
         return (
             tmp.try_resolve_request(
+                vram_mb=vram_mb,
                 vram_mb_each=vram_mb_each,
                 num_gpus=num_gpus,
                 non_gpu=non_gpu,
@@ -1204,6 +1271,7 @@ def _request_reclaim_to_resolve(
 def _shortfall_keys(
     state: State,
     *,
+    vram_mb: list[int] | None,
     vram_mb_each: int | None,
     num_gpus: int,
     non_gpu: dict[str, int],
@@ -1229,11 +1297,16 @@ def _shortfall_keys(
                 keys.add(key)
         elif val > avail.get(key, 0):
             keys.add(key)
-    if num_gpus > 0 and vram_mb_each is not None:
+    gpu_asks = normalize_gpu_asks(
+        vram_mb=vram_mb,
+        vram_mb_each=vram_mb_each,
+        num_gpus=num_gpus,
+    )
+    if gpu_asks:
         per_gpu = state.per_gpu_free()
         if nvml_free is not None:
             per_gpu = {u: min(free, nvml_free.get(u, 0)) for u, free in per_gpu.items()}
         for uuid_str, free in per_gpu.items():
-            if free < vram_mb_each:
+            if free < gpu_asks[0]:
                 keys.add(gpu_vram_key(uuid_str))
     return keys

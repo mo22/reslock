@@ -41,6 +41,27 @@ from reslock.state import (
 
 logger = logging.getLogger(__name__)
 
+GPU_CAPACITY_MIN_RATIO = 0.95
+"""How far below the NVML physical total a registered GPU capacity may sit silently.
+
+The CUDA driver reports less VRAM than the card physically has, and every
+detection path that goes through CUDA (torch's ``total_memory``, our
+``detect_gpu_vram_mb_cuda_driver``) registers *that* number — so an exact
+comparison against the NVML total warns on every correctly configured host.
+
+Measured 2026-08-12, both against ``nvidia-smi``'s ``memory.total``:
+
+* kirk, RTX 3090, Linux driver 570.133.20 — ``cuDeviceTotalMem`` 24135 MB vs
+  24576 MB physical, i.e. **1.8 %** low.
+* spock, RTX 3090, Windows 11 / WDDM — 24575 MB vs 24576 MB, i.e. **0.004 %**.
+
+The reserve is neither constant nor proportional across driver models, which
+is why this is a ratio rather than a fixed MB allowance. The incident the
+tripwire exists for sat at ~18000 of 24576 MB — **27 %** low, an order of
+magnitude past any driver reserve, so 5 % separates the two cases with room
+to spare in both directions.
+"""
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -886,6 +907,13 @@ class ResourcePool:
         registered regardless. Fails soft when NVML is unavailable;
         ``nvml_total_vram_mb`` caches totals per process, so frequent
         re-registration doesn't hammer the driver.
+
+        Values slightly below the NVML total are tolerated, because the CUDA
+        driver legitimately reports less than the physical total and that is
+        what every torch- or driver-API-based detection registers — see
+        ``GPU_CAPACITY_MIN_RATIO`` for the measured numbers. Above the total
+        there is no tolerance: no detection method can produce it, and
+        phantom capacity is the direction that actually mis-schedules.
         """
         gpu_keys = {k: u for k in resources if (u := parse_gpu_vram_key(k)) is not None}
         if not gpu_keys:
@@ -903,14 +931,27 @@ class ResourcePool:
                 continue
             value = resources[key]
             if value < total:
+                if value >= total * GPU_CAPACITY_MIN_RATIO:
+                    logger.debug(
+                        "reslock: set_resources registering %s=%d MB, %d MB (%.1f%%) below "
+                        "the NVML physical total of %d MB — within the CUDA driver reserve, "
+                        "not warning.",
+                        key,
+                        value,
+                        total - value,
+                        (1 - value / total) * 100,
+                        total,
+                    )
+                    continue
                 logger.warning(
-                    "reslock: set_resources registering %s=%d MB, below the NVML physical "
-                    "total of %d MB (caller pid %d). Capacity must be the physical total — "
-                    "transient VRAM usage is handled by the NVML pre-flight at placement "
-                    "time. Do not register derived free-based values; a stale snapshot "
-                    "blocks promotion on an idle host.",
+                    "reslock: set_resources registering %s=%d MB, more than %.0f%% below the "
+                    "NVML physical total of %d MB (caller pid %d). Capacity must be the "
+                    "physical total — transient VRAM usage is handled by the NVML pre-flight "
+                    "at placement time. Do not register derived free-based values; a stale "
+                    "snapshot blocks promotion on an idle host.",
                     key,
                     value,
+                    (1 - GPU_CAPACITY_MIN_RATIO) * 100,
                     total,
                     os.getpid(),
                 )

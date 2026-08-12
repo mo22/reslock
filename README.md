@@ -116,7 +116,8 @@ reslock ships detection functions for common resource types. Dependencies like t
 
 | Function | Resources | Method |
 |----------|-----------|--------|
-| `detect_gpu_vram_mb()` | `gpu_{uuid}_vram_mb`, ... | torch, then nvidia-smi fallback |
+| `detect_gpu_vram_mb()` | `gpu_{uuid}_vram_mb`, ... | CUDA driver API, then torch, then nvidia-smi |
+| `detect_gpu_vram_mb_cuda_driver()` | `gpu_{uuid}_vram_mb`, ... | `libcuda`/`nvcuda` via ctypes — no torch, no nvidia-smi binary, fork-safe |
 | `detect_gpu_vram_mb_torch()` | `gpu_{uuid}_vram_mb`, ... | torch CUDA runtime only (torch ≥ 2.0) |
 | `detect_gpu_vram_mb_nvidia_smi()` | `gpu_{uuid}_vram_mb`, ... | nvidia-smi CLI only |
 | `gpu_resource_key(torch_index)` | `gpu_{uuid}_vram_mb` | maps local torch index → UUID key |
@@ -135,6 +136,21 @@ pool.set_resources(detect_gpu_vram_mb())
 pool.set_resources(detect_cpu_cores())
 pool.set_resources(detect_ram_mb(reserve_mb=32_000))  # keep 32 GB for OS / non-reslock processes
 ```
+
+**Why the CUDA driver API comes first.** `torch.cuda.is_available()` opens the
+`/dev/nvidia*` device files, and a process that has done so can no longer fork a
+CUDA-capable child — so detecting VRAM through torch silently costs the caller the
+ability to fork GPU workers. The driver-API step avoids that: on Linux it does the
+read in a short-lived child process (~250 ms) and the calling process stays clean;
+on Windows, where there is no `fork` to protect, and on a process that already has
+CUDA open, it reads directly (~0.2 ms). It also removes a version dependency —
+torch builds without `get_device_properties().uuid` report nothing at all, which
+used to make the registered capacity depend on the consumer's torch version.
+
+Capacity registered this way is the CUDA-visible total, which sits slightly below
+the card's physical total (measured: 24135 vs 24576 MB on an RTX 3090 under the
+Linux driver, 24575 vs 24576 under Windows/WDDM). That difference is expected and
+`set_resources` does not warn about it — see `GPU_CAPACITY_MIN_RATIO`.
 
 ### CPU / RAM as first-class counters
 

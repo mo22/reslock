@@ -78,40 +78,14 @@ def parse_gpu_vram_key(key: str) -> str | None:
     return None
 
 
-def detect_gpu_vram_mb() -> dict[str, int]:
-    """Detect per-GPU VRAM via nvidia-smi, keyed by host-stable GPU UUID.
-
-    Returns resources like ``{"gpu_GPU-<uuid>_vram_mb": 24000, ...}``.
-    Returns empty dict if nvidia-smi is not available or no GPUs found.
-
-    Keying by UUID (instead of nvidia-smi index) keeps coordination correct
-    across containers that get partial GPU mappings from the NVIDIA container
-    runtime — each container sees only its mapped cards renumbered from 0,
-    but UUIDs are stable across the host.
-    """
-    if not shutil.which("nvidia-smi"):
-        return {}
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=uuid,memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            return {}
-        resources: dict[str, int] = {}
-        for line in result.stdout.strip().splitlines():
-            parts = line.split(",")
-            if len(parts) == 2:
-                uuid_str = parts[0].strip()
-                mb = int(parts[1].strip())
-                if uuid_str:
-                    resources[gpu_vram_key(uuid_str)] = mb
-        return resources
-    except (subprocess.TimeoutExpired, ValueError, OSError):
-        pass
-    return {}
+# NOTE: VRAM *detection* deliberately does not live here. `resources.py` owns it:
+# `detect_gpu_vram_mb()` there is the CUDA-driver → torch → nvidia-smi chain that
+# `__init__.py` exports, and `detect_gpu_vram_mb_nvidia_smi()` is the nvidia-smi-only
+# step. This module used to carry a second, unexported `detect_gpu_vram_mb()` that was
+# nvidia-smi-only; nothing imported it, and it answered a different number than the
+# exported one (physical total vs CUDA-visible — 24576 vs 24135 MB on an RTX 3090),
+# so anyone debugging detection who landed in this file by its name read the wrong
+# function. Removed 2026-08-13; keep detection out of here.
 
 
 # --- Per-process resource measurement (portable) ---

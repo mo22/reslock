@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -33,6 +34,7 @@ from reslock.nvml import (
 )
 from reslock.state import (
     DEFAULT_STATE_PATH,
+    SchemaVersionMismatch,
     ensure_state_file,
     read_state,
     read_state_clean,
@@ -770,7 +772,12 @@ class ResourcePool:
                     return handle
                 await asyncio.sleep(poll_interval)
         except BaseException:
-            self._remove_from_queue(new_entry.id)
+            # Best-effort dequeue: this cleanup itself goes through transact(),
+            # so if the reason we're unwinding is that the state file changed
+            # schema underneath us, it would raise again and mask the original
+            # failure with a less informative copy of itself.
+            with contextlib.suppress(SchemaVersionMismatch):
+                self._remove_from_queue(new_entry.id)
             raise
 
     def try_acquire(
@@ -1055,7 +1062,12 @@ class ResourcePool:
                     return handle
                 time.sleep(poll_interval)
         except BaseException:
-            self._remove_from_queue(new_entry.id)
+            # Best-effort dequeue: this cleanup itself goes through transact(),
+            # so if the reason we're unwinding is that the state file changed
+            # schema underneath us, it would raise again and mask the original
+            # failure with a less informative copy of itself.
+            with contextlib.suppress(SchemaVersionMismatch):
+                self._remove_from_queue(new_entry.id)
             raise
 
     def _try_promote(
@@ -1307,6 +1319,14 @@ def _request_reclaim_to_resolve(
     for lease in state.leases:
         if lease.id in evicted:
             lease.reclaim_requested = True
+            # Stamps the False→True transition only, because `candidates`
+            # above filters out leases that already have reclaim_requested.
+            # That filter is load-bearing for this field, not just an
+            # optimisation: this function runs on every poll tick of every
+            # waiter, so re-stamping would keep a nine-day-old pending reclaim
+            # reading as milliseconds old — destroying exactly the signal the
+            # timestamp exists to carry.
+            lease.reclaim_requested_at = datetime.now(timezone.utc)
 
 
 def _shortfall_keys(

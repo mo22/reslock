@@ -26,6 +26,7 @@ from reslock.resources import (
     detect_network_bandwidth,
     detect_ram_mb,
 )
+from reslock.state import SchemaVersionMismatch, force_reset_state, peek_state_version
 
 __all__ = [
     "CPU_CORES_KEY",
@@ -38,6 +39,7 @@ __all__ = [
     "PoolStatus",
     "QueueEntry",
     "ResourcePool",
+    "SchemaVersionMismatch",
     "State",
     "detect_cpu_cores",
     "detect_disk_mb",
@@ -48,6 +50,7 @@ __all__ = [
     "detect_network_bandwidth",
     "detect_ram_mb",
     "disk_mb_key",
+    "force_reset_state",
     "get_disk_free_mb",
     "gpu_orphans",
     "parse_disk_mb_key",
@@ -55,4 +58,5 @@ __all__ = [
     "gpu_uuid_for_torch_index",
     "gpu_vram_key",
     "parse_gpu_vram_key",
+    "peek_state_version",
 ]

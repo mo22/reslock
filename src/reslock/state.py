@@ -7,7 +7,7 @@ import os
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TypeVar, cast
 
 import portalocker
 
@@ -18,25 +18,58 @@ T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 
-def _load_state(data: str) -> State:
-    """Parse state JSON and migrate across schema versions.
+class SchemaVersionMismatch(RuntimeError):
+    """The state file was written under a different schema version.
 
-    Any non-current ``version`` triggers a reset: ``resources``, ``leases``,
-    and ``queue`` are dropped so the next ``set_resources()`` / ``acquire()``
-    repopulates under the current schema. This is how the v0.5.0 (v1→v2) and
-    v0.8.0 (v2→v3) and v0.11.0 (v3→v4) schema bumps were rolled out —
-    coordinated upgrade across consumers, state file resets on first read by
-    a new-version process.
-    Dead PID cleanup handles stale process entries separately.
+    Raised in both directions — an older *and* a newer file — because the only
+    safe reaction to a state file we do not speak is to not touch it.
+
+    Up to v0.11.1 a mismatch silently returned a fresh empty ``State()``.
+    ``read_state()`` merely passed that through, but ``transact()`` wrote it
+    back: a single ``acquire()`` from an installation with a stale schema
+    erased the lease table of every other consumer sharing the file, leaving a
+    WARNING as the only trace. The consequence is VRAM handed out twice, and it
+    escalates — after the reset the laggard writes *its* schema version, so the
+    up-to-date consumers see a mismatch in turn and reset back.
+
+    Failing instead puts the error where it belongs: the consumer that cannot
+    speak the file's schema refuses to work, and everyone else keeps running.
+
+    Recovery from a genuinely stale file (i.e. an intentional upgrade) is
+    ``reslock reset --force`` / :func:`force_reset_state`, which rewrites the
+    file at the current schema without reading it.
+    """
+
+    def __init__(self, found: object, expected: int, path: Path | None = None) -> None:
+        self.found = found
+        self.expected = expected
+        self.path = path
+        where = f" at {path}" if path is not None else ""
+        super().__init__(
+            f"reslock state file{where} has schema version {found!r}, "
+            f"this reslock speaks v{expected}. Refusing to read or write it — "
+            f"writing would erase the leases of consumers running the other "
+            f"version. Upgrade all consumers sharing this file to matching "
+            f"reslock versions, then 'reslock reset --force' (or delete the "
+            f"file) once they are all stopped."
+        )
+
+
+def _load_state(data: str, path: Path | None = None) -> State:
+    """Parse state JSON, refusing any schema version other than the current one.
+
+    Raises :class:`SchemaVersionMismatch` when ``version`` differs. Dead PID
+    cleanup handles stale process entries separately.
 
     The version is peeked from the raw JSON before strict Pydantic validation,
-    because a v0.7.x state file carries ``Lease.estimated_seconds`` /
-    ``Lease.progress`` fields that v3's ``extra="forbid"`` Lease would reject
-    — without the peek, an upgrade-time read would crash before reaching the
-    reset path.
+    so the mismatch is reported as itself rather than as whatever field-level
+    ``extra="forbid"`` violation the foreign schema happens to trip over first
+    (a v0.7.x file carries ``Lease.estimated_seconds``, a v4 file carries
+    ``QueueEntry.vram_mb``, and so on). Same reason the peek existed when this
+    path still reset the file.
     """
     try:
-        parsed: Any = json.loads(data)
+        parsed: object = json.loads(data)
     except json.JSONDecodeError:
         # Corrupt or empty JSON — fall through to model_validate which raises
         # with detail. This is intentionally fail-closed: a truncated state
@@ -49,15 +82,9 @@ def _load_state(data: str) -> State:
         # Top-level JSON wasn't an object — let pydantic raise the
         # canonical validation error.
         return State.model_validate_json(data)
-    found_version: Any = parsed.get("version")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    found_version = cast("dict[str, object]", parsed).get("version")
     if found_version != SCHEMA_VERSION:
-        logger.warning(
-            "reslock state schema %r detected (expected v%d) — resetting "
-            "resources, leases, and queue. Consumers must re-register resources.",
-            f"v{found_version}",
-            SCHEMA_VERSION,
-        )
-        return State()
+        raise SchemaVersionMismatch(found_version, SCHEMA_VERSION, path)
     return State.model_validate_json(data)
 
 
@@ -125,7 +152,52 @@ def ensure_state_file(path: Path) -> None:
 def read_state(path: Path) -> State:
     with portalocker.Lock(str(path), "r", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
         data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-    return _load_state(data)  # pyright: ignore[reportUnknownArgumentType]
+    return _load_state(data, path)  # pyright: ignore[reportUnknownArgumentType]
+
+
+def peek_state_version(path: Path) -> int | None:
+    """Read only the ``version`` field, without validating the rest.
+
+    For tools that need to *report on* a state file they may not speak —
+    monitoring, ``reslock status``, upgrade checks. Everything else must go
+    through :func:`read_state` / :func:`transact`, which refuse a foreign
+    schema outright.
+
+    Returns ``None`` when the file is missing, unreadable, not JSON, or has no
+    integer ``version``. All four mean "cannot tell", which is deliberately
+    not distinguished from each other here.
+    """
+    try:
+        with portalocker.Lock(str(path), "r", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
+            data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        parsed: object = json.loads(data)  # pyright: ignore[reportUnknownArgumentType]
+    except (OSError, json.JSONDecodeError, portalocker.LockException):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    found = cast("dict[str, object]", parsed).get("version")
+    # bool is an int subclass; a JSON `true` is not a version.
+    return found if isinstance(found, int) and not isinstance(found, bool) else None
+
+
+def force_reset_state(path: Path) -> None:
+    """Overwrite the state file with a fresh, empty state at the current schema.
+
+    The supported recovery from :class:`SchemaVersionMismatch`, and the way a
+    coordinated schema upgrade moves the file forward now that reads no longer
+    reset it. Does not read the existing content — that is the point, since by
+    definition we may not be able to parse it.
+
+    Destructive: every lease and queue entry in the file is dropped, and
+    registered capacities go with them (consumers re-register via
+    ``set_resources()``). Only safe with all consumers stopped — a running
+    holder would keep its resources without the file recording them.
+    """
+    ensure_state_file(path)
+    with portalocker.Lock(str(path), "r+", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
+        fh.seek(0)
+        fh.truncate()
+        fh.write(State().model_dump_json(indent=2))  # pyright: ignore[reportUnknownMemberType]
 
 
 def read_state_clean(path: Path) -> State:
@@ -163,10 +235,14 @@ def transact(path: Path, fn: Callable[[State], T]) -> T:
     The callable `fn` receives the current state (with dead processes cleaned up)
     and may mutate it. The modified state is written back. The return value of `fn`
     is returned to the caller.
+
+    Raises :class:`SchemaVersionMismatch` before `fn` runs and before anything
+    is written when the file was authored under a different schema version —
+    the file is left byte-for-byte untouched.
     """
     with portalocker.Lock(str(path), "r+", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
         data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        state = _load_state(data)  # pyright: ignore[reportUnknownArgumentType]
+        state = _load_state(data, path)  # pyright: ignore[reportUnknownArgumentType]
         remove_dead_processes(state)
         result = fn(state)
         new_data = state.model_dump_json(indent=2)

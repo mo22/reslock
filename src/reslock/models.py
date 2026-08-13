@@ -72,6 +72,7 @@ class Lease(BaseModel):
     wait_sec: float | None = None
     reclaimable: bool = False
     reclaim_requested: bool = False
+    reclaim_requested_at: datetime | None = None
     label: str | None = None
     pids: list[int] = Field(default_factory=list[int])
     actual_resources: dict[str, int] = Field(default_factory=dict)
@@ -141,8 +142,21 @@ class QueueEntry(BaseModel):
         return self.lease_id is not None
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 """Current state-file schema version.
+
+Version 5 (v0.12.0):
+
+* ``Lease`` gained ``reclaim_requested_at`` — the moment ``reclaim_requested``
+  flipped to True. Without it the state file records *that* a reclaim is
+  pending but not *since when*, which is the quantity that distinguishes a
+  cooperating consumer (seconds) from a hung one (the 2026-08-01..10 incident:
+  a llama-server lease held two GPUs for nine days with a pending reclaim).
+  ``acquired_at`` is no substitute — a lease acquired hours ago whose reclaim
+  was requested ten seconds ago would read as a nine-day case immediately.
+* A schema mismatch now **raises** :class:`reslock.state.SchemaVersionMismatch`
+  instead of silently resetting the file. See that class for why the failure
+  direction had to be inverted.
 
 Version 4 (v0.11.0):
 
@@ -169,10 +183,11 @@ Version 3 (v0.8.0):
 Version 2 switched GPU VRAM keys from ``gpu{index}_vram_mb`` to
 ``gpu_{uuid}_vram_mb``. Version 1 used index-based keys.
 
-On reading a file with a lower ``version``, ``reslock.state`` drops
-``resources``, ``leases``, and ``queue`` so consumers repopulate via
-``set_resources()`` and re-acquire under the current schema. Coordinated
-upgrade across consumers is required.
+Reading a file whose ``version`` differs in either direction raises
+:class:`reslock.state.SchemaVersionMismatch`; up to v0.11.1 it silently reset
+``resources``, ``leases``, and ``queue`` instead. Coordinated upgrade across
+all consumers sharing a state file is required: stop them, ``reslock reset
+--force`` (or delete ``state.json``), install matching versions, restart.
 """
 
 

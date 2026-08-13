@@ -223,7 +223,30 @@ reslock list
 reslock release abc-123
 reslock release --label whisper
 reslock reset
+reslock reset --force    # rewrite at this reslock's schema, without reading it
 ```
+
+## Schema versions
+
+The state file carries a `version`. Reading a file written under a different
+version — older *or* newer — raises `SchemaVersionMismatch` and touches
+nothing; every command exits 3 with both versions in the message. A consumer
+that cannot speak the file's schema refuses to work, and the others keep
+running.
+
+Upgrading across a bump is therefore a coordinated action on every consumer
+sharing the file:
+
+```bash
+# 1. stop all consumers on the host
+# 2. install matching reslock versions everywhere
+reslock reset --force     # 3. rewrite the file at the new schema
+# 4. start them again — capacities re-register via set_resources()
+```
+
+`reset --force` drops leases, queue *and* registered capacities, so run it only
+with everything stopped. To report on a file you may not be able to parse, use
+`reslock.peek_state_version(path)`, which reads the version field alone.
 
 ## How resources work
 

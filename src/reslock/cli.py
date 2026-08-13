@@ -25,12 +25,50 @@ from reslock.detect import (
     parse_disk_mb_key,
     parse_gpu_vram_key,
 )
-from reslock.models import QueueEntry, State
+from reslock.models import SCHEMA_VERSION, QueueEntry, State
 from reslock.pool import ResourcePool
 from reslock.resources import detect_cpu_cores, detect_gpu_vram_mb, detect_ram_mb
-from reslock.state import DEFAULT_STATE_PATH, ensure_state_file, transact
+from reslock.state import (
+    DEFAULT_STATE_PATH,
+    SchemaVersionMismatch,
+    ensure_state_file,
+    force_reset_state,
+    transact,
+)
 
 console = Console()
+
+SCHEMA_MISMATCH_EXIT_CODE = 3
+"""Distinct exit code so a monitor can tell 'wrong schema' from other failures."""
+
+
+class _SchemaAwareGroup(click.Group):
+    """Turn a :class:`SchemaVersionMismatch` into a readable message + exit 3.
+
+    Every command touches the state file, and a traceback is the wrong shape
+    for what is an operational condition, not a bug. Reading *about* a foreign
+    state file must stay possible even when reading *from* it is refused —
+    that's the whole point of reporting the version we found.
+    """
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except SchemaVersionMismatch as exc:
+            console.print(
+                f"[red]Schema mismatch:[/red] state file reports "
+                f"[bold]v{exc.found}[/bold], this reslock speaks "
+                f"[bold]v{exc.expected}[/bold]."
+            )
+            if exc.path is not None:
+                console.print(f"[dim]File:[/dim] {exc.path}")
+            console.print(
+                "[yellow]Refusing to touch it[/yellow] — writing would erase the "
+                "leases of consumers running the other version.\n"
+                "Upgrade every consumer sharing this file to matching reslock "
+                "versions, stop them all, then run [bold]reslock reset --force[/bold]."
+            )
+            ctx.exit(SCHEMA_MISMATCH_EXIT_CODE)
 
 
 def _parse_size(value: str) -> int:
@@ -45,7 +83,7 @@ def _parse_size(value: str) -> int:
     return int(num)
 
 
-@click.group()
+@click.group(cls=_SchemaAwareGroup)
 @click.version_option(package_name="reslock")
 def main() -> None:
     """Resource lock manager for coordinating shared system resources."""
@@ -102,6 +140,26 @@ def set_resource(resource: str, value: int, state: Path | None) -> None:
 
     transact(path, _set)
     console.print(f"[green]Set[/green] {resource} = {value}")
+
+
+def _fmt_pending_reclaim(requested_at: datetime | None, now: datetime) -> str:
+    """Render how long a reclaim has been pending, as a ``(…)`` suffix.
+
+    Empty string when the timestamp is missing — a lease written by a v4
+    consumer before the field existed, which reads as "unknown", not "just
+    now". Only leases whose reclaim actually predates the upgrade can show
+    this, and only until they are released.
+    """
+    if requested_at is None:
+        return ""
+    secs = int((now - requested_at).total_seconds())
+    if secs < 60:
+        return f" ({secs}s)"
+    if secs < 3600:
+        return f" ({secs // 60}m)"
+    if secs < 86400:
+        return f" ({secs // 3600}h)"
+    return f" ({secs // 86400}d)"
 
 
 def _shorten_resource_key(key: str) -> str:
@@ -196,7 +254,11 @@ def status(state: Path | None, short: bool) -> None:
             if lease.reclaimable:
                 flags.append("reclaimable")
             if lease.reclaim_requested:
-                flags.append("reclaim_requested")
+                # The age is the operationally interesting part: a reclaim
+                # that is being honoured clears within seconds, so anything
+                # older is a consumer that stopped listening.
+                pending = _fmt_pending_reclaim(lease.reclaim_requested_at, now)
+                flags.append(f"reclaim_requested{pending}")
             table.add_row(
                 lease.id,
                 str(lease.pid),
@@ -326,10 +388,34 @@ def release(lease_id: str | None, label: str | None, state: Path | None) -> None
 
 @main.command()
 @click.option("--state", "-s", type=click.Path(path_type=Path), default=None)
-def reset(state: Path | None) -> None:
-    """Clear all state (leases, queue)."""
+@click.option(
+    "--force",
+    is_flag=True,
+    help=(
+        "Rewrite the file at this reslock's schema without reading it. "
+        "Recovery from a schema mismatch; also drops registered capacities. "
+        "Only with all consumers stopped."
+    ),
+)
+def reset(state: Path | None, force: bool) -> None:
+    """Clear all state (leases, queue).
+
+    Plain ``reset`` reads the file first and therefore refuses a foreign
+    schema. ``--force`` skips the read: it is the supported way to move a
+    stale state file forward during a coordinated upgrade, and the only one
+    that works when the file cannot be parsed at all.
+    """
     path = state or DEFAULT_STATE_PATH
     ensure_state_file(path)
+
+    if force:
+        force_reset_state(path)
+        console.print(
+            f"[green]State reset to schema v{SCHEMA_VERSION}[/green] "
+            "(leases, queue and registered capacities dropped — "
+            "consumers re-register on their next set_resources())."
+        )
+        return
 
     def _reset(st: State) -> None:
         st.leases.clear()
@@ -502,7 +588,8 @@ def top(interval: float, count: int | None, state: Path | None) -> None:
                 if lease.reclaimable:
                     flags.append("R")
                 if lease.reclaim_requested:
-                    flags.append("[red]RECLAIM[/red]")
+                    pending = _fmt_pending_reclaim(lease.reclaim_requested_at, now)
+                    flags.append(f"[red]RECLAIM{pending}[/red]")
 
                 lease_table.add_row(
                     pid_str,

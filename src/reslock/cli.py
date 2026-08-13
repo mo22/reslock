@@ -16,6 +16,8 @@ from rich.console import Console
 from rich.table import Table
 
 from reslock.detect import (
+    CPU_CORES_KEY,
+    RAM_MB_KEY,
     disk_mb_key,
     get_all_pid_vram_mb,
     get_all_pid_vram_per_gpu_mb,
@@ -708,13 +710,20 @@ def run(
     if vram_each_mb is not None and num_gpus == 0:
         raise click.UsageError("--num-gpus must be > 0 when --vram-mb-each is set")
 
+    ram_mb = _parse_size(ram) if ram else None
+    cpu_cores = cpu or None
+    disk_reserve_mb = _parse_size(disk) if disk else None
+
+    # Only for the waiting message and the "asked for nothing" check below —
+    # acquire() gets these as explicit kwargs and folds them into the same
+    # keys itself.
     non_gpu: dict[str, int] = {}
-    if ram:
-        non_gpu["ram_mb"] = _parse_size(ram)
-    if cpu:
-        non_gpu["cpu_cores"] = cpu
-    if disk:
-        non_gpu[disk_mb_key(disk_path)] = _parse_size(disk)
+    if ram_mb is not None:
+        non_gpu[RAM_MB_KEY] = ram_mb
+    if cpu_cores is not None:
+        non_gpu[CPU_CORES_KEY] = cpu_cores
+    if disk_reserve_mb is not None:
+        non_gpu[disk_mb_key(disk_path)] = disk_reserve_mb
 
     if vram_mb is None and num_gpus == 0 and not non_gpu:
         raise click.UsageError(
@@ -742,11 +751,15 @@ def run(
         vram_mb=vram_mb,
         vram_mb_each=vram_each_mb,
         num_gpus=num_gpus,
+        cpu_cores=cpu_cores,
+        ram_mb=ram_mb,
+        disk_mb=disk_reserve_mb,
+        # disk_path without disk_mb is an error, and --disk-path has a default.
+        disk_path=disk_path if disk_reserve_mb is not None else None,
         priority=priority,
         label=label,
         reclaimable=reclaimable,
         estimated_seconds=estimated_seconds,
-        **non_gpu,
     ) as lease:
         console.print(f"[green]Acquired lease {lease.id}[/green]")
         # Pin the child to the granted GPUs. CUDA accepts UUID-form

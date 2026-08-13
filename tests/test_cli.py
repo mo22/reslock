@@ -8,7 +8,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from reslock.cli import main
-from reslock.detect import gpu_vram_key
+from reslock.detect import CPU_CORES_KEY, RAM_MB_KEY, disk_mb_key, gpu_vram_key
 from reslock.models import SCHEMA_VERSION, Lease, State
 from reslock.state import ensure_state_file, transact
 
@@ -264,3 +264,87 @@ def test_status_omits_the_age_when_the_timestamp_is_absent(tmp_path: Path) -> No
     assert result.exit_code == 0
     assert "reclaim_requested" in result.output
     assert "reclaim_requested (" not in result.output
+
+
+def test_run_reserves_ram_cpu_and_disk_under_the_standard_keys(tmp_path: Path) -> None:
+    """The non-GPU flags must arrive on the lease under the canonical keys.
+
+    They used to be splatted into ``acquire()`` as ``**non_gpu``, which pyright
+    flagged (an int could bind the ``disk_path: str | None`` kwarg) and which
+    let the CLI's key spelling drift from ``_fold_first_class``'s. They are
+    explicit kwargs now, so the two cannot disagree.
+
+    The child copies the state file while the lease is held — the released
+    state says nothing about what was reserved.
+    """
+    from reslock import ResourcePool
+
+    path = tmp_path / "state.json"
+    snapshot = tmp_path / "held.json"
+    pool = ResourcePool(path)
+    pool.set_resources({CPU_CORES_KEY: 8, RAM_MB_KEY: 4096})
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run",
+            "--ram",
+            "1G",
+            "--cpu",
+            "2",
+            "--disk",
+            "100",
+            "--disk-path",
+            str(tmp_path),
+            "--state",
+            str(path),
+            "--",
+            sys.executable,
+            "-c",
+            "import shutil, sys; shutil.copy(sys.argv[1], sys.argv[2])",
+            str(path),
+            str(snapshot),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    held = State.model_validate_json(snapshot.read_text())
+    assert len(held.leases) == 1
+    assert held.leases[0].resources == {
+        RAM_MB_KEY: 1024,
+        CPU_CORES_KEY: 2,
+        disk_mb_key(str(tmp_path)): 100,
+    }
+
+
+def test_run_without_disk_does_not_reserve_a_mount(tmp_path: Path) -> None:
+    """``--disk-path`` has a default, so it must not be forwarded on its own —
+    ``disk_path`` without ``disk_mb`` raises in ``_fold_first_class``.
+    """
+    from reslock import ResourcePool
+
+    path = tmp_path / "state.json"
+    snapshot = tmp_path / "held.json"
+    pool = ResourcePool(path)
+    pool.set_resources({CPU_CORES_KEY: 8})
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "run",
+            "--cpu",
+            "1",
+            "--state",
+            str(path),
+            "--",
+            sys.executable,
+            "-c",
+            "import shutil, sys; shutil.copy(sys.argv[1], sys.argv[2])",
+            str(path),
+            str(snapshot),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    held = State.model_validate_json(snapshot.read_text())
+    assert held.leases[0].resources == {CPU_CORES_KEY: 1}

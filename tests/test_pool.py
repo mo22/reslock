@@ -422,3 +422,107 @@ def test_shrink_promotes_queued_waiter(tmp_path: Path) -> None:
     finally:
         holder.release()
         t.join(timeout=2.0)
+
+
+# --- release() failure semantics ---
+
+
+def test_release_retries_after_transient_transact_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed ``release()`` must surface the error AND leave the handle
+    re-callable so a retry actually drops the lease.
+
+    Sibling of ``test_entries.py::test_complete_retries_after_transient_transact_failure``.
+    ``EntryHandle.complete()`` got this fix in 0.8.1 (799a9a6); ``release()``
+    kept setting ``_released = True`` *before* the state write, so any failing
+    ``transact()`` left the lease in the file while the fast path
+    ``if self._released: return`` blocked every retry — the capacity stayed
+    booked until the process died and dead-PID cleanup removed it.
+
+    v0.12.0 made this easy to hit: ``SchemaVersionMismatch`` fails on *every*
+    ``transact()`` for a process working against a foreign-schema file.
+    """
+    from collections.abc import Callable
+    from typing import Any
+
+    import reslock.pool as pool_mod
+
+    pool = _make_pool(tmp_path, scratch_mb=8000)
+    lease = pool.try_acquire(scratch_mb=6000)
+    assert lease is not None
+    assert pool.status().available["scratch_mb"] == 2000
+
+    real_transact = pool_mod.transact
+    fail_once = {"armed": True}
+
+    def flaky_transact(path: Path, fn: Callable[[State], Any]) -> Any:
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise OSError("simulated transient state-file failure")
+        return real_transact(path, fn)
+
+    monkeypatch.setattr(pool_mod, "transact", flaky_transact)
+
+    # 1) The error surfaces — callers cannot miss it without catching.
+    with pytest.raises(OSError, match="simulated transient"):
+        lease.release()
+
+    # 2) The lease is still in the file, still holding its capacity. A handle
+    #    that latched here would have made this permanent.
+    assert len(read_state(tmp_path / "state.json").leases) == 1
+    assert pool.status().available["scratch_mb"] == 2000
+
+    # 3) The retry actually re-attempts the write — this is the assertion the
+    #    bug would fail; a test that only checked "it raises" would not notice.
+    lease.release()
+    assert read_state(tmp_path / "state.json").leases == []
+    assert pool.status().available["scratch_mb"] == 8000
+
+    # 4) Further calls are idempotent no-ops.
+    lease.release()
+    assert read_state(tmp_path / "state.json").leases == []
+
+
+def test_release_failure_leaves_attached_entry_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed ``release()`` must not mark the auto-tracked entry completed.
+
+    ``release()`` auto-completes ``lease.entry``. Doing that before the write
+    succeeded would leave an entry that is attached in the file but a no-op
+    in memory — the exact wedge 0.8.1 fixed on ``complete()``.
+    """
+    from collections.abc import Callable
+    from typing import Any
+
+    import reslock.pool as pool_mod
+
+    pool = _make_pool(tmp_path, scratch_mb=8000)
+    lease = pool.try_acquire(scratch_mb=6000, estimated_seconds=30)
+    assert lease is not None
+    entry = lease.entry
+    assert entry is not None
+    assert len(pool.status().queue) == 1
+
+    real_transact = pool_mod.transact
+    fail_once = {"armed": True}
+
+    def flaky_transact(path: Path, fn: Callable[[State], Any]) -> Any:
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise OSError("simulated transient state-file failure")
+        return real_transact(path, fn)
+
+    monkeypatch.setattr(pool_mod, "transact", flaky_transact)
+
+    with pytest.raises(OSError, match="simulated transient"):
+        lease.release()
+
+    # Entry still attached in the file, and its handle still able to write.
+    assert len(pool.status().queue) == 1
+    entry.complete()
+    assert pool.status().queue == []
+
+    lease.release()
+    assert read_state(tmp_path / "state.json").leases == []

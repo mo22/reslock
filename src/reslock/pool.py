@@ -554,9 +554,22 @@ class LeaseHandle:
         return EntryHandle(new_entry, self._pool)
 
     def release(self) -> None:
+        """Drop the lease (and any still-attached entries) from the state file.
+
+        Raises whatever ``transact()`` raises (lock timeout, OS error,
+        :class:`~reslock.state.SchemaVersionMismatch`). Callers MUST NOT
+        swallow these silently — a failed ``release()`` leaves the lease in
+        the file, holding capacity that peers are waiting for until the
+        process dies and dead-PID cleanup removes it. Retrying ``release()``
+        is safe and idempotent: the handle is only marked released once the
+        state write succeeds, so a re-call after a transient failure will
+        actually re-attempt the write rather than silently no-op.
+
+        See ``tests/test_pool.py::test_release_retries_after_transient_transact_failure``
+        for the contract (mirrors :meth:`EntryHandle.complete`).
+        """
         if self._released:
             return
-        self._released = True
         lease_id = self._lease.id
 
         def _release(state: State) -> None:
@@ -567,6 +580,7 @@ class LeaseHandle:
             state.queue = [e for e in state.queue if e.lease_id != lease_id]
 
         transact(self._pool._path, _release)  # pyright: ignore[reportPrivateUsage]
+        self._released = True
         if self._entry is not None:
             self._entry._completed = True  # pyright: ignore[reportPrivateUsage]
 
@@ -597,6 +611,10 @@ class LeaseHandle:
               (also auto-completing any attached entries).
             - No-op on an already-released lease (matches ``release()``).
             - ``actual_resources`` is not modified — use ``update()`` for that.
+            - Like ``release()``, nothing is latched on a failed ``transact()``:
+              the handle stays usable. If the write that empties the lease
+              succeeds but the follow-up ``release()`` raises, retry
+              ``release()`` (not ``shrink()`` — the keys are already gone).
         """
         if self._released:
             return

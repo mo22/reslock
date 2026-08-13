@@ -1,8 +1,13 @@
-# v0.12.0 (Schema v5) ist committet, aber nicht ausgeliefert
+# v0.12.0 (Schema v5) ist veröffentlicht, aber nicht ausgerollt
 
-**Stand 2026-08-13:** `a98993b` + `c683c7e` sind auf main gepusht. **Kein GitHub-Release,
-nicht auf PyPI, nichts davon läuft auf kirk.** Die Änderung ist damit wirkungslos, bis der
-Rollout gemacht ist.
+**Stand 2026-08-13, nach dem Release:** `v0.12.0` ist getaggt, das GitHub-Release steht, und
+trusted publishing hat nach PyPI geschoben — geprüft: `uvx --from 'reslock==0.12.0'` zieht
+das Rad, meldet `reslock, version 0.12.0` und `SCHEMA_VERSION = 5`, und
+`SchemaVersionMismatch` / `peek_state_version` / `force_reset_state` sind im
+veröffentlichten Paket vorhanden.
+
+**Auf kirk läuft davon weiterhin nichts.** Schritt 1 unten ist erledigt, die Schritte 2–5
+sind offen, und bis dahin ist die Änderung dort wirkungslos.
 
 ## Was der Rollout verlangt
 
@@ -10,8 +15,9 @@ v4 → v5 ist ein Schemasprung, und mit dem neuen Verhalten ist er ein **erzwung
 Wartungsfenster**, keine rollende Aktualisierung: sobald eine Datei v5 trägt, verweigern alle
 v4-Verbraucher, und umgekehrt.
 
-1. GitHub-Release mit Tag `v0.12.0` anlegen → trusted publishing schiebt nach PyPI
-   (nicht `uv publish` von Hand, siehe „Publishing" in AGENTS.md).
+1. ~~GitHub-Release mit Tag `v0.12.0` anlegen → trusted publishing schiebt nach PyPI
+   (nicht `uv publish` von Hand, siehe „Publishing" in AGENTS.md).~~ **Erledigt 2026-08-13**,
+   Run 31694829917 grün, auf PyPI verifiziert.
 2. Alle Verbraucher auf kirk stoppen — Stand 2026-08-12 waren das **17 Container**
    (2 aiserver + kirk-rpcserver + 14 scriba-Mandanten; die zwei intellex-ocr mounten die
    Datei nur, haben reslock nicht installiert).

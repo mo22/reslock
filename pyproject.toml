@@ -79,7 +79,18 @@ known-first-party = ["reslock"]
 
 [tool.pyright]
 pythonVersion = "3.10"
+# reslock runs on Linux, macOS and Windows, and branches on all three (the POSIX
+# `resource` import shim, /proc reads, libcuda.so.1 vs nvcuda.dll). Pyright otherwise
+# defaults to the platform it happens to run on and narrows `sys.platform` to a
+# constant — which both (a) reports the *other* platforms' live branches as dead code
+# (get_self_rss_mb's Linux return read as unreachable on a Mac) and, worse, (b) means
+# those branches are never type-checked at all on that developer's machine. "All"
+# keeps every platform branch reachable and checked.
+pythonPlatform = "All"
 typeCheckingMode = "strict"
+# Genuinely unreachable code is worth seeing, but not worth failing on: a future
+# `sys.version_info >= (3, 11)` guard is legitimately dead under pythonVersion 3.10.
+reportUnreachable = "warning"
 ignore = ["**/node_modules", "**/__pycache__", "examples"]
 
 [tool.pytest.ini_options]

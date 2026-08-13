@@ -42,7 +42,17 @@ uvx ruff check --fix src/ tests/  # lint
   see what a `reslock run` lease actually reserved, have the child copy the state file — the
   released state says nothing.
 - pyright baseline: 3 errors, all pre-existing in `tests/test_disk_resources.py`. `src/` is
-  clean; anything new there is yours.
+  clean; anything new there is yours. **Run it as `uv run --with pyright pyright`** — bare
+  `uvx pyright` runs outside the project venv, can't see portalocker/pytest types, and
+  reports **662** errors, nearly all `reportUnknownMemberType` noise. Don't start "fixing"
+  that wall; it is the invocation, not the code.
+- `pythonPlatform = "All"` is set deliberately (2026-08-13). Pyright otherwise narrows
+  `sys.platform` to whatever machine it runs on, which reported the Linux branch of
+  `get_self_rss_mb()` as structurally unreachable on a Mac — and, the actual cost, meant the
+  Windows and Linux branches were never type-checked there at all. `reportUnreachable` is
+  `"warning"`, not `"error"`, so a future `sys.version_info >= (3, 11)` guard (legitimately
+  dead under `pythonVersion = "3.10"`) stays visible without breaking the build. Currently
+  0 warnings.
 
 ## Publishing
 

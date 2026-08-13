@@ -26,6 +26,24 @@ uvx ruff format src/ tests/ # format
 uvx ruff check --fix src/ tests/  # lint
 ```
 
+### Testing notes
+
+- **`tests/test_pool_nvml.py::test_blocking_acquire_grants_after_holder_releases` is a known
+  flake — ignore it.** Its daemon waiter thread outlives the monkeypatch teardown and hits the
+  real `nvmlInit()`, which fails on a machine without NVML. Measured ~1/20 at HEAD in a clean
+  worktree and ~1/13 on a working tree, i.e. pre-existing and unrelated to whatever you are
+  changing. Moritz decided (2026-08-13) to leave it; deliberately not filed as a task, so
+  don't re-investigate it as a new finding.
+- A lease seeded into a state file for a test needs a **live** pid (`os.getpid()`) — `status()`
+  reads via `read_state_clean`, which drops dead-PID leases before rendering.
+- Asserting on `reslock status` output needs `env={"COLUMNS": "200"}` in `CliRunner.invoke`:
+  rich truncates columns at the default 80 chars (`reclaim_re…`).
+- `CliRunner` patches `sys.stdout`, not the fd, so it cannot capture a subprocess's output. To
+  see what a `reslock run` lease actually reserved, have the child copy the state file — the
+  released state says nothing.
+- pyright baseline: 3 errors, all pre-existing in `tests/test_disk_resources.py`. `src/` is
+  clean; anything new there is yours.
+
 ## Publishing
 
 Publishing is handled by GitHub Actions (`.github/workflows/publish.yml`). To release:

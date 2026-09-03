@@ -5,17 +5,26 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import IO, TypeVar, cast
 
 import portalocker
+import pydantic
 
 from reslock.cleanup import has_dead_processes, remove_dead_processes
 from reslock.models import SCHEMA_VERSION, State
 
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
+
+# A reader that finds unparseable JSON re-reads this many times, sleeping
+# ``TORN_READ_DELAY_SEC`` between attempts, before raising. Bounded, so a file
+# that is genuinely corrupt still fails — after ~100 ms instead of at once.
+# See :func:`_load_state_retrying` for what "torn" means and where it comes from.
+TORN_READ_RETRIES = 5
+TORN_READ_DELAY_SEC = 0.02
 
 
 class SchemaVersionMismatch(RuntimeError):
@@ -149,10 +158,83 @@ def ensure_state_file(path: Path) -> None:
             path.chmod(0o666)
 
 
-def read_state(path: Path) -> State:
+def _is_torn_read(exc: pydantic.ValidationError) -> bool:
+    """True when every error in ``exc`` is a JSON syntax error.
+
+    A state file is written as one JSON object whose last byte is the closing
+    brace, so every strict prefix of it is syntactically invalid JSON — which
+    is exactly what pydantic reports as ``json_invalid``. Field-level errors
+    mean a complete but wrong document; those are never torn reads.
+    """
+    errors = exc.errors()
+    return bool(errors) and all(e["type"] == "json_invalid" for e in errors)
+
+
+def _load_state_retrying(path: Path, read: Callable[[], str]) -> State:
+    """Parse the state read by ``read()``, re-reading a bounded number of times
+    while the content is syntactically invalid JSON.
+
+    Why a torn read is possible at all: reslock < 0.12.2 wrote the state file
+    in place through a buffered handle and portalocker's ``Lock.release()``
+    drops the flock *before* ``close()`` flushes that buffer. For a file below
+    the 8 KiB buffer size the truncate had landed and the new content had not,
+    so a reader taking the shared lock in that window saw 0 bytes (measured
+    on macOS and in the kirk container, 2026-09-03; aiserver's reclaim loop
+    died on it after 30 h of dev traffic). Since 0.12.2 every writer flushes
+    before releasing the lock, so a torn read can only come from a consumer
+    still on an older reslock sharing the file, or from a process crash
+    between truncate and write. The retry covers the former during a rolling
+    upgrade; the latter stays a hard error after the retries are exhausted.
+
+    Only JSON syntax errors are retried. :class:`SchemaVersionMismatch` and
+    field-level validation errors describe a complete document and are raised
+    at once. An empty file is a torn read, never "fresh empty state" — the
+    0.12.0 rule that a read never resets the file stands.
+    """
+    for attempt in range(TORN_READ_RETRIES + 1):
+        data = read()
+        try:
+            return _load_state(data, path)
+        except pydantic.ValidationError as exc:
+            if not _is_torn_read(exc) or attempt == TORN_READ_RETRIES:
+                raise
+            logger.debug(
+                "Torn read of %s (%d bytes), retry %d/%d",
+                path,
+                len(data),
+                attempt + 1,
+                TORN_READ_RETRIES,
+            )
+            time.sleep(TORN_READ_DELAY_SEC)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _read_shared(path: Path) -> str:
     with portalocker.Lock(str(path), "r", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
-        data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-    return _load_state(data, path)  # pyright: ignore[reportUnknownArgumentType]
+        return fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+
+def _flush_locked(fh: IO[str]) -> None:
+    """Push a locked handle's buffered content to disk *before* the lock goes.
+
+    portalocker's ``Lock.release()`` is ``unlock(fh); fh.close()`` — the
+    flush that ``close()`` implies happens after the flock is gone. Calling
+    this as the last statement inside the ``with`` block moves the content
+    under the lock. ``fsync`` is cheap here (one small file per lease change)
+    and makes the write durable, not merely visible.
+    """
+    fh.flush()
+    os.fsync(fh.fileno())
+
+
+def read_state(path: Path) -> State:
+    """Read and validate the state file under a shared lock.
+
+    Re-reads a few times if the content is not valid JSON (see
+    :func:`_load_state_retrying`); the shared lock is released between
+    attempts so a writer can finish.
+    """
+    return _load_state_retrying(path, lambda: _read_shared(path))
 
 
 def peek_state_version(path: Path) -> int | None:
@@ -167,12 +249,20 @@ def peek_state_version(path: Path) -> int | None:
     integer ``version``. All four mean "cannot tell", which is deliberately
     not distinguished from each other here.
     """
-    try:
-        with portalocker.Lock(str(path), "r", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
-            data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        parsed: object = json.loads(data)  # pyright: ignore[reportUnknownArgumentType]
-    except (OSError, json.JSONDecodeError, portalocker.LockException):
-        return None
+    parsed: object = None
+    for attempt in range(TORN_READ_RETRIES + 1):
+        try:
+            parsed = json.loads(_read_shared(path))
+        except json.JSONDecodeError:
+            # Same torn-read window as read_state(); bounded retry, then
+            # "cannot tell" rather than an exception — this is a peek.
+            if attempt == TORN_READ_RETRIES:
+                return None
+            time.sleep(TORN_READ_DELAY_SEC)
+            continue
+        except (OSError, portalocker.LockException):
+            return None
+        break
     if not isinstance(parsed, dict):
         return None
     found = cast("dict[str, object]", parsed).get("version")
@@ -198,6 +288,7 @@ def force_reset_state(path: Path) -> None:
         fh.seek(0)
         fh.truncate()
         fh.write(State().model_dump_json(indent=2))  # pyright: ignore[reportUnknownMemberType]
+        _flush_locked(fh)  # pyright: ignore[reportUnknownArgumentType]
 
 
 def read_state_clean(path: Path) -> State:
@@ -239,14 +330,29 @@ def transact(path: Path, fn: Callable[[State], T]) -> T:
     Raises :class:`SchemaVersionMismatch` before `fn` runs and before anything
     is written when the file was authored under a different schema version —
     the file is left byte-for-byte untouched.
+
+    The write is in place on the locked inode and flushed + fsynced before
+    the lock is released (:func:`_flush_locked`), so a reader holding the
+    shared lock always sees the complete document. It is deliberately *not*
+    a temp file + ``os.replace``: the flock lives on the state file's inode,
+    so after a replace a writer that was blocked on the old inode would get
+    its lock on an unlinked file, read stale content and write into the void
+    — a lost update, worse than a torn read. Atomic replace would need a
+    separate lock file, and that is a locking-protocol change every consumer
+    sharing the file has to make at once; the flush is additive.
     """
     with portalocker.Lock(str(path), "r+", timeout=5) as fh:  # pyright: ignore[reportUnknownVariableType]
-        data: str = fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        state = _load_state(data, path)  # pyright: ignore[reportUnknownArgumentType]
+
+        def _read_locked() -> str:
+            fh.seek(0)
+            return fh.read()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+        state = _load_state_retrying(path, _read_locked)
         remove_dead_processes(state)
         result = fn(state)
         new_data = state.model_dump_json(indent=2)
         fh.seek(0)
         fh.truncate()
         fh.write(new_data)  # pyright: ignore[reportUnknownMemberType]
+        _flush_locked(fh)  # pyright: ignore[reportUnknownArgumentType]
     return result

@@ -23,6 +23,7 @@ def _fake_pynvml(
     *,
     init_raises: bool = False,
     uuid_returns_bytes: bool = False,
+    mem_not_supported: bool = False,
 ) -> Any:
     """Build a stub `pynvml` module exposing the surface reslock uses.
 
@@ -53,8 +54,13 @@ def _fake_pynvml(
             self.free = free_mb * 1024 * 1024
             self.used = self.total - self.free
 
+    class NVMLError_NotSupported(Exception):  # noqa: N801 - mirrors pynvml's class name
+        value = 3
+
     def _mem(handle: int) -> _Mem:
         _, total_mb, free_mb = devices[handle]
+        if mem_not_supported:
+            raise NVMLError_NotSupported("Not Supported")
         return _Mem(total_mb, free_mb)
 
     module.nvmlInit = _init  # type: ignore[attr-defined]
@@ -175,4 +181,47 @@ def test_nvml_free_vram_mb_raises_when_init_fails(
     monkeypatch.setitem(sys.modules, "pynvml", fake)
 
     with pytest.raises(nvml.NvmlUnavailableError, match="nvmlInit"):
+        nvml.nvml_free_vram_mb(cache_seconds=0)
+
+
+# --- unified memory (NVML_ERROR_NOT_SUPPORTED on nvmlDeviceGetMemoryInfo) ---
+
+
+def test_memory_info_not_supported_falls_back_to_meminfo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """DGX Spark GB10: nvmlInit/count/UUID work, memory info raises NotSupported."""
+    fake = _fake_pynvml([("GPU-spark", 0, 0)], mem_not_supported=True)
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       127600816 kB\nMemFree:        101726404 kB\nMemAvailable:   118062852 kB\n"
+    )
+    real_open: Any = builtins.open
+
+    def _open(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if path == "/proc/meminfo":
+            return real_open(meminfo, *args, **kwargs)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _open)
+
+    assert nvml.nvml_total_vram_mb() == {"GPU-spark": 127600816 // 1024}
+    assert nvml.nvml_free_vram_mb(cache_seconds=0) == {"GPU-spark": 118062852 // 1024}
+
+
+def test_memory_info_other_nvml_error_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only NotSupported is a unified-memory signal; anything else stays a hard failure."""
+    fake = _fake_pynvml([("GPU-aaa", 24000, 14600)])
+
+    class NVMLError_Unknown(Exception):  # noqa: N801
+        value = 999
+
+    def _boom(_handle: int) -> Any:
+        raise NVMLError_Unknown("driver wedged")
+
+    fake.nvmlDeviceGetMemoryInfo = _boom
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
+
+    with pytest.raises(NVMLError_Unknown):
         nvml.nvml_free_vram_mb(cache_seconds=0)

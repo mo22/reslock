@@ -74,6 +74,53 @@ def _ensure_initialized() -> Any:
     return _pynvml
 
 
+def _is_not_supported(ex: BaseException) -> bool:
+    """True for pynvml's NVML_ERROR_NOT_SUPPORTED (value 3), matched by class name or
+    error value so a stubbed module in tests needs neither the real class hierarchy nor
+    the real constant."""
+    if type(ex).__name__ == "NVMLError_NotSupported":
+        return True
+    return getattr(ex, "value", None) == 3
+
+
+def _meminfo_mb() -> tuple[int, int]:
+    """``(MemTotal, MemAvailable)`` in MB from ``/proc/meminfo``."""
+    total = avail = None
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemTotal:"):
+                total = int(line.split()[1]) // 1024
+            elif line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) // 1024
+    if total is None or avail is None:
+        raise NvmlUnavailableError(
+            "reslock: NVML memory info is unsupported on this GPU and /proc/meminfo has no "
+            "MemTotal/MemAvailable to fall back on"
+        )
+    return total, avail
+
+
+def _device_memory_mb(m: Any, handle: Any) -> tuple[int, int]:
+    """``(total_mb, free_mb)`` for one device.
+
+    Unified-memory parts (NVIDIA GB10 in the DGX Spark, measured 2026-09-09 with driver
+    580.173.02) answer ``nvmlDeviceGetMemoryInfo`` with ``NVML_ERROR_NOT_SUPPORTED`` —
+    ``nvidia-smi`` prints ``[N/A]`` for memory there — while ``nvmlInit``, the device count
+    and the UUID work. There the GPU's memory *is* the host RAM (torch's
+    ``total_memory`` equals ``MemTotal``), so ``/proc/meminfo`` is the honest reading:
+    ``MemTotal`` as total, ``MemAvailable`` as free. Any other NVML error keeps propagating;
+    the hard-fail policy in this module's docstring is about a broken driver, and a broken
+    driver must stay loud.
+    """
+    try:
+        mem = m.nvmlDeviceGetMemoryInfo(handle)
+    except Exception as ex:
+        if not _is_not_supported(ex):
+            raise
+        return _meminfo_mb()
+    return int(mem.total) // (1024 * 1024), int(mem.free) // (1024 * 1024)
+
+
 def request_uses_gpu_vram(resources: dict[str, int]) -> bool:
     """True if any resource key is a per-GPU VRAM key (``gpu_<uuid>_vram_mb``)."""
     return any(parse_gpu_vram_key(k) is not None for k in resources)
@@ -100,9 +147,7 @@ def nvml_free_vram_mb(cache_seconds: float = 1.0) -> dict[str, int]:
         handle = m.nvmlDeviceGetHandleByIndex(i)
         uuid_raw = m.nvmlDeviceGetUUID(handle)
         uuid_str = uuid_raw.decode() if isinstance(uuid_raw, bytes) else str(uuid_raw)
-        mem = m.nvmlDeviceGetMemoryInfo(handle)
-        free_bytes = int(mem.free)
-        out[uuid_str] = free_bytes // (1024 * 1024)
+        out[uuid_str] = _device_memory_mb(m, handle)[1]
     _free_cache = out
     _free_cache_at = now
     return dict(out)
@@ -129,8 +174,7 @@ def nvml_total_vram_mb() -> dict[str, int]:
         handle = m.nvmlDeviceGetHandleByIndex(i)
         uuid_raw = m.nvmlDeviceGetUUID(handle)
         uuid_str = uuid_raw.decode() if isinstance(uuid_raw, bytes) else str(uuid_raw)
-        mem = m.nvmlDeviceGetMemoryInfo(handle)
-        out[uuid_str] = int(mem.total) // (1024 * 1024)
+        out[uuid_str] = _device_memory_mb(m, handle)[0]
     _total_cache = out
     return dict(out)
 
